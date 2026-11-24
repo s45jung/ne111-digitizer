@@ -587,7 +587,10 @@ section[data-testid="stSidebar"] { border-right:1px solid var(--line); }
 
 /* mode radio rendered as underlined tabs (WORKOUTS | PLANS) */
 .st-key-mode_radio div[role="radiogroup"] { display:flex; gap:0; width:100%; border-bottom:1px solid var(--line); }
+.st-key-mode_radio, .st-key-mode_radio [data-testid="stRadio"],
+.st-key-mode_radio [data-testid="stRadio"] > div { width:100% !important; }
 .st-key-mode_radio div[role="radiogroup"] > * { flex:1; margin:0 !important; }
+.st-key-mode_radio [data-testid="stRadioOption"] p { white-space:nowrap; }
 .st-key-mode_radio [data-testid="stRadioOption"] { width:100%; justify-content:center; margin:0;
     padding:.65rem 0 .7rem; border-bottom:2px solid transparent; cursor:pointer; }
 .st-key-mode_radio [data-testid="stRadioOption"] > div > div:first-child { display:none; }
