@@ -562,9 +562,8 @@ def instruction(calibrated: bool, cal_err: str | None):
             st.warning(f"Calibrate the axes first. {cal_err}", icon="⚠️")
         else:
             ds = ss.datasets[ss.active]
-            st.info(f"**Click data points** to add them to "
-                    f"<span class='swatch' style='background:{ds['color']}'></span>"
-                    f"**{ds['name']}**.", icon="➕")
+            st.info(f"**Click data points** to add them to **{ds['name']}**. "
+                    "Use ➕ New on the right for another curve.", icon="➕")
     else:
         st.info("**Click a point** to delete it.", icon="✖️")
 
