@@ -27,10 +27,68 @@ import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+import base64
+import tempfile
+
+# --------------------------------------------------------------------------
+# Clickable-image component (self-contained, written to a temp folder)
+# --------------------------------------------------------------------------
+# Shows the plot at the column width, reports clicks as fractions of the image
+# size, and draws a magnifier loupe under the cursor for precise placement.
+
+CLICK_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><style>
+html,body{margin:0;padding:0;background:transparent;overflow:hidden}
+#wrap{position:relative;width:100%;line-height:0}
+#img{width:100%;height:auto;display:block;cursor:crosshair;user-select:none;
+     -webkit-user-drag:none;border-radius:6px}
+#loupe{position:absolute;pointer-events:none;width:160px;height:160px;border-radius:50%;
+       border:2px solid #fff;box-shadow:0 0 0 1px #000,0 8px 24px rgba(0,0,0,.55);
+       background-repeat:no-repeat;background-color:#fff;display:none}
+#loupe:before,#loupe:after{content:"";position:absolute;background:rgba(255,40,40,.85)}
+#loupe:before{left:50%;top:22%;bottom:22%;width:1px}
+#loupe:after{top:50%;left:22%;right:22%;height:1px}
+</style></head><body><div id="wrap"><img id="img" alt="plot"><div id="loupe"></div></div>
+<script>
+const img=document.getElementById("img"), loupe=document.getElementById("loupe");
+let mag=3, lastH=-1;
+function send(type,data){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},data),"*");}
+function setH(){const h=Math.ceil(document.getElementById("wrap").getBoundingClientRect().height);
+  if(h!==lastH){lastH=h;send("streamlit:setFrameHeight",{height:h});}}
+window.addEventListener("message",function(e){
+  if(!e.data||e.data.type!=="streamlit:render")return;
+  const a=e.data.args; mag=a.magnify||0;
+  if(img.getAttribute("src")!==a.src){img.setAttribute("src",a.src);}
+  loupe.style.backgroundImage="url('"+a.src+"')"; setH();});
+img.onload=setH; new ResizeObserver(setH).observe(document.body);
+img.addEventListener("click",function(ev){const r=img.getBoundingClientRect();
+  send("streamlit:setComponentValue",{dataType:"json",value:{
+    x:(ev.clientX-r.left)/r.width,y:(ev.clientY-r.top)/r.height,t:Date.now()}});});
+img.addEventListener("mousemove",function(ev){
+  if(mag<=1){loupe.style.display="none";return;}
+  const r=img.getBoundingClientRect(), x=ev.clientX-r.left, y=ev.clientY-r.top, R=80;
+  loupe.style.display="block"; loupe.style.left=(x-R)+"px"; loupe.style.top=(y-R)+"px";
+  loupe.style.backgroundSize=(r.width*mag)+"px "+(r.height*mag)+"px";
+  loupe.style.backgroundPosition=(R-x*mag)+"px "+(R-y*mag)+"px";});
+img.addEventListener("mouseleave",function(){loupe.style.display="none";});
+send("streamlit:componentReady",{apiVersion:1});
+</script></body></html>"""
+
 try:
-    from streamlit_image_coordinates import streamlit_image_coordinates
-except ImportError:  # lets the pure functions below be imported for testing
-    streamlit_image_coordinates = None
+    import streamlit.components.v1 as _components
+    _comp_dir = Path(tempfile.gettempdir()) / "ne111_plot_click_v1"
+    _comp_dir.mkdir(exist_ok=True)
+    (_comp_dir / "index.html").write_text(CLICK_HTML, encoding="utf-8")
+    _plot_click = _components.declare_component("plot_click", path=str(_comp_dir))
+except Exception:  # lets the pure functions below be imported for testing
+    _plot_click = None
+
+
+def clickable_image(img: Image.Image, key: str, magnify: float):
+    """Show `img`; return {"x": fx, "y": fy, "t": ms} (fractions of size) on click."""
+    buf = io.BytesIO()
+    img.save(buf, "PNG", optimize=False, compress_level=3)
+    src = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    return _plot_click(src=src, magnify=magnify, key=key, default=None)
 
 # --------------------------------------------------------------------------
 # Constants
@@ -53,8 +111,8 @@ MODES = [MODE_CAL, MODE_ADD, MODE_DEL]
 IMAGE_TYPES = ["png", "jpg", "jpeg", "gif", "tif", "tiff", "bmp", "webp"]
 # Widget values that must survive while their widget is not on screen.
 PERSIST_KEYS = ["xlabel", "ylabel", "xlog", "ylog", "X1_val", "X2_val", "Y1_val",
-                "Y2_val", "zoom", "pan_x", "pan_y", "sort_x", "connect"]
-RENDER_W = 1000  # pixel width the plot is drawn at before the browser scales it
+                "Y2_val", "zoom", "pan_x", "pan_y", "sort_x", "connect", "magnify"]
+RENDER_W = 1200  # pixel width the plot is drawn at before the browser scales it
 MAX_HISTORY = 100
 
 
@@ -350,7 +408,7 @@ def init_state():
             ss[k] = ss[k]
     defaults = {"xlabel": "x", "ylabel": "y", "xlog": False, "ylog": False,
                 "X1_val": 0.0, "X2_val": 10.0, "Y1_val": 0.0, "Y2_val": 10.0,
-                "zoom": 1.0, "pan_x": 0.5, "pan_y": 0.5,
+                "zoom": 1.0, "pan_x": 0.5, "pan_y": 0.5, "magnify": 3.0,
                 "sort_x": False, "connect": False, "img_hash": None, "use_sample": False}
     for k, v in defaults.items():
         ss.setdefault(k, v)
@@ -468,7 +526,7 @@ def handle_click(px: float, py: float, tol: float):
 # UI sections
 # --------------------------------------------------------------------------
 # Visual language: pure black, dark-grey cards, white uppercase type with wide
-# tracking, small grey section labels, heavy italic headline, underlined tabs.
+# tracking, small grey section labels, heavy upright headline, underlined tabs.
 
 CSS = """
 <style>
@@ -529,13 +587,15 @@ section[data-testid="stSidebar"] { border-right:1px solid var(--line); }
 
 /* mode radio rendered as underlined tabs (WORKOUTS | PLANS) */
 .st-key-mode_radio div[role="radiogroup"] { display:flex; gap:0; width:100%; border-bottom:1px solid var(--line); }
-.st-key-mode_radio div[role="radiogroup"] > label { flex:1; justify-content:center; margin:0;
+.st-key-mode_radio div[role="radiogroup"] > * { flex:1; margin:0 !important; }
+.st-key-mode_radio [data-testid="stRadioOption"] { width:100%; justify-content:center; margin:0;
     padding:.65rem 0 .7rem; border-bottom:2px solid transparent; cursor:pointer; }
-.st-key-mode_radio div[role="radiogroup"] > label > div:first-child { display:none; }
-.st-key-mode_radio div[role="radiogroup"] > label p { text-transform:uppercase; letter-spacing:.1em;
+.st-key-mode_radio [data-testid="stRadioOption"] > div > div:first-child { display:none; }
+.st-key-mode_radio [data-testid="stRadioOption"] p { text-transform:uppercase; letter-spacing:.1em;
     font-weight:600; font-size:.82rem; color:var(--muted); }
-.st-key-mode_radio div[role="radiogroup"] > label:has(input:checked) { border-bottom-color:#fff; }
-.st-key-mode_radio div[role="radiogroup"] > label:has(input:checked) p { color:#fff; }
+.st-key-mode_radio [data-testid="stRadioOption"][data-selected="true"] { border-bottom-color:#fff; }
+.st-key-mode_radio [data-testid="stRadioOption"][data-selected="true"] p { color:#fff; }
+.st-key-mode_radio [data-testid="stRadioOption"]:hover p { color:#fff; }
 
 /* buttons */
 .stButton button, .stDownloadButton button, [data-testid="stPopover"] button {
@@ -617,6 +677,9 @@ def sidebar_settings(img: Image.Image, info: dict):
 
     st.sidebar.write("")
     label("View", where=st.sidebar)
+    st.sidebar.select_slider("Magnifier", options=[1.0, 2.0, 3.0, 4.0, 6.0], key="magnify",
+                             format_func=lambda m: "Off" if m == 1 else f"{m:g}×",
+                             help="Loupe that follows the cursor over the plot")
     st.sidebar.select_slider("Zoom", options=[1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0], key="zoom",
                              format_func=lambda z: f"{z:g}×",
                              help="Zoom in to place points more precisely")
@@ -845,15 +908,12 @@ def image_panel(img: Image.Image, img_hash: str):
     highlight = ss.calib_next if ss.mode == MODE_CAL else None
     disp = render_view(img, view, RENDER_W, ss.calib, ss.datasets, ss.active, highlight, ss.connect)
     # Rendered sharp at RENDER_W, then scaled by the browser to fit the column.
-    # The component reports the displayed width/height, used below to map back.
-    value = streamlit_image_coordinates(disp, key=f"img_{img_hash}",
-                                        use_column_width="always", cursor="crosshair")
+    value = clickable_image(disp, key=f"img_{img_hash}", magnify=ss.magnify)
     if value and value != ss.last_click:
         ss.last_click = value
         x0, y0, cw, ch = view
-        sx = cw / (value.get("width") or disp.width)
-        sy = ch / (value.get("height") or disp.height)
-        handle_click(x0 + value["x"] * sx, y0 + value["y"] * sy, 12 * sx)
+        # tolerance for delete: ~1.5% of the visible width
+        handle_click(x0 + value["x"] * cw, y0 + value["y"] * ch, 0.015 * cw)
         st.rerun()
 
 
