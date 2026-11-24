@@ -48,7 +48,7 @@ CAL_HELP = {
     "Y1": "a point on the **y-axis** whose value you know (e.g. the lowest labelled tick)",
     "Y2": "a second **y-axis** point, as far from Y1 as possible",
 }
-MODE_CAL, MODE_ADD, MODE_DEL = "📐 Calibrate axes", "➕ Add points", "✖️ Delete points"
+MODE_CAL, MODE_ADD, MODE_DEL = "Calibrate", "Add points", "Delete points"
 MODES = [MODE_CAL, MODE_ADD, MODE_DEL]
 IMAGE_TYPES = ["png", "jpg", "jpeg", "gif", "tif", "tiff", "bmp", "webp"]
 # Widget values that must survive while their widget is not on screen.
@@ -467,33 +467,130 @@ def handle_click(px: float, py: float, tol: float):
 # --------------------------------------------------------------------------
 # UI sections
 # --------------------------------------------------------------------------
+# Visual language: pure black, dark-grey cards, white uppercase type with wide
+# tracking, small grey section labels, heavy italic headline, underlined tabs.
 
 CSS = """
 <style>
-.block-container {padding-top: 2.2rem; padding-bottom: 2rem;}
-.step {display:inline-block; padding:.25rem .75rem; margin-right:.4rem; border-radius:999px;
-       font-size:.9rem; border:1px solid rgba(128,128,128,.35);}
-.step.done {background:rgba(33,195,84,.15); border-color:rgba(33,195,84,.6);}
-.step.now {background:rgba(28,131,225,.15); border-color:rgba(28,131,225,.7); font-weight:600;}
-.swatch {display:inline-block; width:.9rem; height:.9rem; border-radius:50%;
-         border:2px solid white; box-shadow:0 0 0 1px #0006; vertical-align:-2px; margin-right:.35rem;}
-.legend span.item {margin-right:1rem; white-space:nowrap;}
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,400..900;1,400..900&display=swap');
+:root { --card:#1c1c1e; --card-hi:#2a2a2c; --line:#2c2c2e; --muted:#8e8e93; --soft:#c7c7cc; }
+.stApp p, .stApp label, .stApp button, .stApp input, .stApp textarea, .stApp li,
+.stApp h1, .stApp h2, .stApp h3, .stApp td, .stApp th, .dg-root { font-family:'Montserrat', sans-serif; }
+header[data-testid="stHeader"] { background:#000; }
+.block-container { padding-top:2.4rem; padding-bottom:3rem; max-width:1500px; }
+section[data-testid="stSidebar"] { border-right:1px solid var(--line); }
+
+/* top bar, like the phone's "CREATE" header */
+.dg-topbar { text-align:center; font-weight:600; letter-spacing:.22em; font-size:.8rem;
+             padding:.2rem 0 1.1rem; border-bottom:1px solid var(--line); margin-bottom:1.2rem; }
+.dg-eyebrow { text-align:center; letter-spacing:.25em; font-size:.85rem; font-weight:500;
+              color:var(--soft); margin-top:2.5rem; }
+.dg-hero { text-align:center; font-weight:900; font-style:italic; text-transform:uppercase;
+           font-size:clamp(1.8rem, 4vw, 3rem); line-height:1.08; letter-spacing:.01em;
+           margin:.6rem auto 2.2rem; max-width:900px; }
+.dg-label { color:var(--soft); text-transform:uppercase; letter-spacing:.09em; font-size:.74rem;
+            font-weight:600; margin:.4rem 0 .55rem; }
+.dg-label .r { float:right; color:var(--muted); }
+
+/* list cards */
+.dg-card { background:var(--card); border-radius:6px; padding:.95rem 1.1rem; display:flex;
+           align-items:center; gap:.8rem; border-left:3px solid transparent; }
+.dg-card.active { border-left-color:#fff; background:var(--card-hi); }
+.dg-card .t { font-weight:700; text-transform:uppercase; letter-spacing:.06em; font-size:.88rem; }
+.dg-card .s { color:var(--muted); text-transform:uppercase; letter-spacing:.07em; font-size:.68rem;
+              margin-top:.2rem; }
+.dg-card .grow { flex:1; min-width:0; }
+.dg-card .dots { color:var(--muted); letter-spacing:.1em; font-weight:700; }
+.dg-card .num { font-weight:900; font-style:italic; font-size:1.4rem; color:var(--muted); width:2.2rem; }
+.swatch { display:inline-block; width:.85rem; height:.85rem; border-radius:50%; flex:none;
+          box-shadow:0 0 0 2px #000, 0 0 0 3px #555; }
+
+/* whole dataset card clickable: invisible button stretched over it */
+[class*="st-key-dscard_"] { position:relative; gap:0 !important; }
+[class*="st-key-dscard_"] [data-testid="stElementContainer"]:has(button) {
+    position:absolute; inset:0; z-index:2; margin:0; }
+[class*="st-key-dscard_"] [data-testid="stElementContainer"]:has(button) * { width:100%; height:100%; }
+[class*="st-key-dscard_"] button { opacity:0; cursor:pointer; }
+
+/* instruction banner */
+.dg-banner { background:var(--card); border-radius:6px; padding:.85rem 1.1rem; margin:.2rem 0 1rem;
+             border-left:3px solid #fff; }
+.dg-banner.warn { border-left-color:#ff9f0a; }
+.dg-banner.ok { border-left-color:#30d158; }
+.dg-banner .msg { font-size:.95rem; }
+.dg-banner .dg-label { margin:0 0 .25rem; }
+
+/* step tracker */
+.dg-steps { display:flex; gap:.5rem; flex-wrap:wrap; margin-bottom:1rem; }
+.dg-step { padding:.35rem .8rem; border-radius:999px; border:1px solid var(--line); color:var(--muted);
+           text-transform:uppercase; letter-spacing:.08em; font-size:.68rem; font-weight:600; }
+.dg-step.done { color:#fff; }
+.dg-step.now { background:#fff; color:#000; border-color:#fff; }
+
+/* mode radio rendered as underlined tabs (WORKOUTS | PLANS) */
+.st-key-mode_radio div[role="radiogroup"] { display:flex; gap:0; width:100%; border-bottom:1px solid var(--line); }
+.st-key-mode_radio div[role="radiogroup"] > label { flex:1; justify-content:center; margin:0;
+    padding:.65rem 0 .7rem; border-bottom:2px solid transparent; cursor:pointer; }
+.st-key-mode_radio div[role="radiogroup"] > label > div:first-child { display:none; }
+.st-key-mode_radio div[role="radiogroup"] > label p { text-transform:uppercase; letter-spacing:.1em;
+    font-weight:600; font-size:.82rem; color:var(--muted); }
+.st-key-mode_radio div[role="radiogroup"] > label:has(input:checked) { border-bottom-color:#fff; }
+.st-key-mode_radio div[role="radiogroup"] > label:has(input:checked) p { color:#fff; }
+
+/* buttons */
+.stButton button, .stDownloadButton button, [data-testid="stPopover"] button {
+    background:var(--card); border:1px solid transparent; color:#fff; border-radius:6px; }
+.stButton button p, .stDownloadButton button p, [data-testid="stPopover"] button p {
+    text-transform:uppercase; letter-spacing:.08em; font-weight:600; font-size:.74rem; }
+.stButton button:hover, .stDownloadButton button:hover, [data-testid="stPopover"] button:hover {
+    background:var(--card-hi); border-color:#3a3a3c; color:#fff; }
+button[data-testid="stBaseButton-primary"] { background:#fff !important; color:#000 !important; }
+button[data-testid="stBaseButton-primary"] p { color:#000 !important; }
+button[data-testid="stBaseButton-primary"]:hover { background:#d9d9d9 !important; }
+.stButton button:disabled { opacity:.35; }
+
+/* inputs and cards */
+[data-baseweb="input"], [data-baseweb="select"] > div, [data-baseweb="textarea"] {
+    background:var(--card) !important; border-color:transparent !important; }
+[data-testid="stFileUploaderDropzone"] { background:var(--card); border:1px dashed #3a3a3c; }
+[class*="st-key-card_"] { background:var(--card); border:none !important; }
+.stApp label p { text-transform:uppercase; letter-spacing:.07em; font-size:.7rem; font-weight:600;
+                 color:var(--soft); }
+.st-key-mode_radio label p { font-size:.82rem; }
+[data-testid="stCaptionContainer"] { color:var(--muted); }
+hr { border-color:var(--line) !important; }
 </style>
 """
 
 
+def md_to_html(text: str) -> str:
+    """Tiny **bold** -> <b>bold</b> converter for banner messages."""
+    parts = text.split("**")
+    return "".join(f"<b>{p}</b>" if i % 2 else p for i, p in enumerate(parts))
+
+
+def label(text: str, right: str = "", where=st):
+    r = f"<span class='r'>{right}</span>" if right else ""
+    where.markdown(f"<div class='dg-label'>{text}{r}</div>", unsafe_allow_html=True)
+
+
+def banner(step: str, msg: str, kind: str = ""):
+    st.markdown(f"<div class='dg-banner {kind}'><div class='dg-label'>{step}</div>"
+                f"<div class='msg'>{md_to_html(msg)}</div></div>", unsafe_allow_html=True)
+
+
 def sidebar_image() -> tuple[bytes | None, str]:
-    st.sidebar.header("1 · Image")
+    label("Image", where=st.sidebar)
     up = st.sidebar.file_uploader(
-        "Upload a plot image", type=IMAGE_TYPES,
+        "Upload a plot image", type=IMAGE_TYPES, label_visibility="collapsed",
         help="PNG, JPG, GIF, TIFF, BMP or WebP. Colour or greyscale.")
     if up is not None:
         return up.getvalue(), Path(up.name).stem
     c1, c2 = st.sidebar.columns(2)
-    c1.button("Sample plot", on_click=cb_set, kwargs={"use_sample": True},
+    c1.button("Sample", on_click=cb_set, kwargs={"use_sample": True}, width="stretch",
               help="A semi-log plot scanned 3° crooked")
     if ss.use_sample:
-        c2.button("Close it", on_click=cb_set, kwargs={"use_sample": False})
+        c2.button("Close", on_click=cb_set, kwargs={"use_sample": False}, width="stretch")
         return cached_sample(), "sample_plot"
     return None, ""
 
@@ -510,20 +607,22 @@ def cached_decode(data: bytes):
 
 def sidebar_settings(img: Image.Image, info: dict):
     kind = "greyscale" if info["greyscale"] else "colour"
-    frames = f" · first of {info['frames']} frames" if info["frames"] > 1 else ""
+    frames = f" · frame 1 of {info['frames']}" if info["frames"] > 1 else ""
     st.sidebar.caption(f"{info['format']} · {info['size'][0]}×{info['size'][1]} px · {kind}{frames}")
 
-    st.sidebar.header("2 · Axis labels")
+    st.sidebar.write("")
+    label("Axis labels", where=st.sidebar)
     st.sidebar.text_input("x-axis label", key="xlabel", help="Used as the column header in the CSV")
     st.sidebar.text_input("y-axis label", key="ylabel")
 
-    st.sidebar.header("3 · View")
+    st.sidebar.write("")
+    label("View", where=st.sidebar)
     st.sidebar.select_slider("Zoom", options=[1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0], key="zoom",
                              format_func=lambda z: f"{z:g}×",
                              help="Zoom in to place points more precisely")
     if ss.zoom > 1:
-        st.sidebar.slider("Pan left ↔ right", 0.0, 1.0, key="pan_x", step=0.01)
-        st.sidebar.slider("Pan up ↕ down", 0.0, 1.0, key="pan_y", step=0.01)
+        st.sidebar.slider("Pan left / right", 0.0, 1.0, key="pan_x", step=0.01)
+        st.sidebar.slider("Pan up / down", 0.0, 1.0, key="pan_y", step=0.01)
         view = compute_view(img.width, img.height, ss.zoom, ss.pan_x, ss.pan_y)
         thumb = img.copy()
         thumb.thumbnail((300, 300))
@@ -535,102 +634,112 @@ def sidebar_settings(img: Image.Image, info: dict):
     st.sidebar.checkbox("Connect points with lines", key="connect")
 
 
-def step_tracker(have_img: bool, calibrated: bool, n_pts: int):
-    steps = [("Upload image", have_img), ("Calibrate axes", calibrated),
-             ("Click data points", n_pts > 0), ("Download CSV", False)]
-    html, current_found = [], False
+def step_tracker(calibrated: bool, n_pts: int):
+    steps = [("Upload", True), ("Calibrate", calibrated), ("Digitize", n_pts > 0), ("Export", False)]
+    out, current_found = [], False
     for i, (name, done) in enumerate(steps, 1):
         cls = "done" if done else ("now" if not current_found else "")
-        if not done:
-            current_found = True
-        html.append(f'<span class="step {cls}">{"✓" if done else i} {name}</span>')
-    st.markdown("".join(html), unsafe_allow_html=True)
+        current_found = current_found or not done
+        out.append(f"<span class='dg-step {cls}'>{'✓' if done else f'0{i}'}&nbsp; {name}</span>")
+    st.markdown(f"<div class='dg-steps'>{''.join(out)}</div>", unsafe_allow_html=True)
 
 
 def instruction(calibrated: bool, cal_err: str | None):
     if ss.mode == MODE_CAL:
         if ss.calib_next:
-            st.info(f"**Click the image to place {ss.calib_next}**: {CAL_HELP[ss.calib_next]}.",
-                    icon="📐")
+            banner("Step 2 · Calibrate",
+                   f"Click the image to place **{ss.calib_next}**, {CAL_HELP[ss.calib_next]}.")
         elif calibrated:
-            st.success("Calibration done. Check the values on the right, then start digitizing.",
-                       icon="✅")
+            banner("Step 2 · Calibrate",
+                   "Calibration done. Check the values on the right, then start digitizing.", "ok")
         else:
-            st.warning(cal_err, icon="⚠️")
+            banner("Step 2 · Calibrate", cal_err or "", "warn")
     elif ss.mode == MODE_ADD:
         if not calibrated:
-            st.warning(f"Calibrate the axes first. {cal_err}", icon="⚠️")
+            banner("Step 3 · Digitize", f"Calibrate the axes first. {cal_err}", "warn")
         else:
             ds = ss.datasets[ss.active]
-            st.info(f"**Click data points** to add them to **{ds['name']}**. "
-                    "Use ➕ New on the right for another curve.", icon="➕")
+            banner("Step 3 · Digitize",
+                   f"Click data points to add them to **{ds['name']}**. "
+                   "Use **+ New** for another curve.")
     else:
-        st.info("**Click a point** to delete it.", icon="✖️")
+        banner("Edit", "Click a point on the image to delete it.")
 
 
 def calibration_panel(calibrated: bool, cal_err: str | None):
-    st.subheader("Axis calibration")
+    label("Axis calibration")
     st.caption("Place two points on each axis at values you know (labelled ticks are best). "
                "Rotated or skewed scans are handled automatically.")
     for axis, keys in (("x", ("X1", "X2")), ("y", ("Y1", "Y2"))):
-        with st.container(border=True):
+        with st.container(border=True, key=f"card_{axis}"):
             st.toggle(f"Logarithmic {axis}-axis", key=f"{axis}log")
             for k in keys:
                 c1, c2 = st.columns([1.1, 1])
                 placed = ss.calib[k] is not None
                 is_next = ss.calib_next == k
-                label = f"{'✓' if placed else '○'} {'Move' if placed else 'Place'} {k}"
-                c1.button(label, key=f"pick_{k}", type="primary" if is_next else "secondary",
+                text = f"{'✓ Move' if placed else 'Place'} {k}"
+                c1.button(text, key=f"pick_{k}", type="primary" if is_next else "secondary",
                           on_click=cb_set, kwargs={"calib_next": k}, width="stretch",
                           help=f"Then click {CAL_HELP[k]}")
                 c2.number_input(f"{k} value", key=f"{k}_val", format="%g",
                                 label_visibility="collapsed")
     tx, ty = axis_tilt(ss.calib)
     if calibrated:
-        tilt = max(abs(tx or 0), abs(ty or 0))
-        msg = f"x-axis tilt {tx:+.2f}°, y-axis tilt {ty:+.2f}°"
-        if tilt > 0.3:
-            msg += " (rotation corrected)"
-        st.caption("📏 " + msg)
+        msg = f"x-axis tilt {tx:+.2f}° · y-axis tilt {ty:+.2f}°"
+        if max(abs(tx), abs(ty)) > 0.3:
+            msg += " · rotation corrected"
+        st.caption(msg)
         st.button("Start digitizing →", type="primary", width="stretch",
                   on_click=cb_set, kwargs={"mode": MODE_ADD})
     elif cal_err and not ss.calib_next:
         st.error(cal_err)
-    st.button("Reset calibration", on_click=cb_reset_calibration)
+    st.button("Reset calibration", on_click=cb_reset_calibration, width="stretch")
+
+
+def dataset_cards():
+    """List of datasets styled like the reference's workout cards; click to select."""
+    for i, ds in enumerate(ss.datasets):
+        n = len(ds["points"])
+        active = i == ss.active
+        with st.container(key=f"dscard_{ds['uid']}"):
+            st.markdown(
+                f"<div class='dg-card {'active' if active else ''}'>"
+                f"<span class='swatch' style='background:{ds['color']}'></span>"
+                f"<div class='grow'><div class='t'>{ds['name']}</div>"
+                f"<div class='s'>{n} point{'s' if n != 1 else ''}"
+                f"{' · active' if active else ''}</div></div>"
+                f"<span class='dots'>•••</span></div>", unsafe_allow_html=True)
+            st.button(f"Select {ds['name']}", key=f"sel_{ds['uid']}",
+                      on_click=cb_set, kwargs={"active": i})
 
 
 def datasets_panel(A, off):
-    st.subheader("Datasets")
-    legend = "".join(
-        f"<span class='item'><span class='swatch' style='background:{ds['color']}'></span>"
-        f"{ds['name']} ({len(ds['points'])})</span>" for ds in ss.datasets)
-    st.markdown(f"<div class='legend'>{legend}</div>", unsafe_allow_html=True)
-
-    names = [ds["name"] for ds in ss.datasets]
+    h1, h2 = st.columns([3, 1.2], vertical_alignment="bottom")
+    with h1:
+        label("Datasets", f"{len(ss.datasets)} total")
+    h2.button("+ New", on_click=cb_add_dataset, width="stretch", help="Add another dataset")
     ss.active = min(ss.active, len(ss.datasets) - 1)
-    ss.active_radio = ss.active
-    c1, c2 = st.columns([3, 1.3], vertical_alignment="bottom")
-    c1.selectbox("Active dataset (new clicks go here)", range(len(names)), key="active_radio",
-                 format_func=lambda i: names[i], on_change=cb_copy,
-                 args=("active_radio", "active"))
-    c2.button("➕ New", on_click=cb_add_dataset, width="stretch", help="Add another dataset")
+    dataset_cards()
 
     ds = ss.datasets[ss.active]
-    c1, c2 = st.columns([3, 1.3], vertical_alignment="bottom")
+    st.write("")
+    label("Edit selected")
+    c1, c2 = st.columns([3, 1.2], vertical_alignment="bottom")
     ds["name"] = c1.text_input("Name", value=ds["name"], key=f"name_{ds['uid']}").strip() \
         or f"Dataset {ss.active + 1}"
     ds["color"] = c2.color_picker("Colour", value=ds["color"], key=f"color_{ds['uid']}")
 
     b1, b2, b3 = st.columns(3)
-    b1.button("↶ Last point", on_click=cb_remove_last, args=(ss.active,), width="stretch",
+    b1.button("↶ Last pt", on_click=cb_remove_last, args=(ss.active,), width="stretch",
               disabled=not ds["points"], help="Remove the last point of this dataset")
     b2.button("Clear", on_click=cb_clear, args=(ss.active,), width="stretch",
               disabled=not ds["points"], help="Remove all points of this dataset")
-    with b3.popover("🗑 Delete", width="stretch"):
+    with b3.popover("Delete", width="stretch"):
         st.write(f"Delete **{ds['name']}** and its {len(ds['points'])} points?")
         st.button("Yes, delete", type="primary", on_click=cb_delete_dataset, args=(ss.active,))
 
-    st.markdown("**Points** · edit values or delete rows; the marks on the image update.")
+    st.write("")
+    label("Points", "edit to move marks")
     if A is None:
         st.caption("Calibrate the axes to see values.")
         return
@@ -671,8 +780,8 @@ def apply_table_edits(ds, df, edited, pix, A, off):
 
 def results_section(A, off, file_stem: str):
     st.divider()
-    st.subheader("Results")
     if A is None:
+        label("Results")
         st.caption("Calibrate the axes and click some points to see the results here.")
         return
     export = []
@@ -684,9 +793,11 @@ def results_section(A, off, file_stem: str):
         export.append({"name": ds["name"], "data": data})
     csv_text = build_csv(export, ss.xlabel, ss.ylabel)
     filled = [e for e in export if e["data"]]
+    total = sum(len(e["data"]) for e in filled)
+    label("Results", f"{len(filled)} datasets · {total} points")
 
     c1, c2, c3 = st.columns([2, 2, 3], vertical_alignment="center")
-    c1.download_button("⬇️ Download CSV", csv_text.encode("utf-8-sig"),
+    c1.download_button("Download CSV", csv_text.encode("utf-8-sig"),
                        file_name=f"{file_stem or 'digitized'}_data.csv", mime="text/csv",
                        type="primary", disabled=not filled, width="stretch")
     c2.checkbox("Sort each dataset by x", key="sort_x")
@@ -709,25 +820,30 @@ def results_section(A, off, file_stem: str):
 
 
 def welcome():
-    st.markdown(
-        """
-Extract numbers from a picture of a graph when the raw data isn't available.
-
-1. **Upload** an image of the plot in the sidebar, or try the sample plot.
-2. **Calibrate** by clicking two known points on each axis and typing their values.
-   Log axes and crooked scans are supported.
-3. **Digitize** by clicking the data points. Use several datasets for several curves.
-4. **Download** the CSV.
-"""
-    )
-    st.button("Try a sample plot", type="primary", on_click=cb_set, kwargs={"use_sample": True})
+    st.markdown("<div class='dg-eyebrow'>PLOT DIGITIZER</div>"
+                "<div class='dg-hero'>Turn any graph into<br>data you can use</div>",
+                unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        label("How it works")
+        steps = [("Upload", "PNG, JPG, GIF or TIFF · colour or greyscale"),
+                 ("Calibrate", "Two known points per axis · linear or log · crooked scans OK"),
+                 ("Digitize", "Click the data · one colour per dataset"),
+                 ("Export", "CSV with dataset names and axis labels")]
+        for i, (t, s) in enumerate(steps, 1):
+            st.markdown(f"<div class='dg-card' style='margin-bottom:.5rem'>"
+                        f"<span class='num'>0{i}</span><div class='grow'><div class='t'>{t}</div>"
+                        f"<div class='s'>{s}</div></div></div>", unsafe_allow_html=True)
+        st.write("")
+        st.button("Try a sample plot", type="primary", width="stretch",
+                  on_click=cb_set, kwargs={"use_sample": True})
+        st.caption("Or upload your own image in the sidebar.")
 
 
 def image_panel(img: Image.Image, img_hash: str):
     view = compute_view(img.width, img.height, ss.zoom, ss.pan_x, ss.pan_y)
-    disp_w = RENDER_W
     highlight = ss.calib_next if ss.mode == MODE_CAL else None
-    disp = render_view(img, view, disp_w, ss.calib, ss.datasets, ss.active, highlight, ss.connect)
+    disp = render_view(img, view, RENDER_W, ss.calib, ss.datasets, ss.active, highlight, ss.connect)
     # Rendered sharp at RENDER_W, then scaled by the browser to fit the column.
     # The component reports the displayed width/height, used below to map back.
     value = streamlit_image_coordinates(disp, key=f"img_{img_hash}",
@@ -737,8 +853,7 @@ def image_panel(img: Image.Image, img_hash: str):
         x0, y0, cw, ch = view
         sx = cw / (value.get("width") or disp.width)
         sy = ch / (value.get("height") or disp.height)
-        tol = 12 * sx
-        handle_click(x0 + value["x"] * sx, y0 + value["y"] * sy, tol)
+        handle_click(x0 + value["x"] * sx, y0 + value["y"] * sy, 12 * sx)
         st.rerun()
 
 
@@ -747,15 +862,15 @@ def image_panel(img: Image.Image, img_hash: str):
 # --------------------------------------------------------------------------
 
 def main():
-    st.set_page_config(page_title="NE111 Plot Digitizer", page_icon="📈", layout="wide")
+    st.set_page_config(page_title="Plot Digitizer", page_icon="📈", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
     init_state()
 
     data, stem = sidebar_image()
-    st.title("📈 Plot Digitizer")
     if data is None:
         welcome()
         return
+    st.markdown("<div class='dg-topbar'>PLOT DIGITIZER</div>", unsafe_allow_html=True)
 
     img_hash = hashlib.md5(data).hexdigest()[:12]
     if ss.img_hash != img_hash:
@@ -770,14 +885,15 @@ def main():
 
     A, off, cal_err = calibration()
     n_pts = sum(len(ds["points"]) for ds in ss.datasets)
-    step_tracker(True, A is not None, n_pts)
 
-    top1, top2 = st.columns([4, 1], vertical_alignment="center")
-    ss.mode_radio = ss.mode
-    top1.radio("Mode", MODES, key="mode_radio", horizontal=True, label_visibility="collapsed",
-               on_change=cb_copy, args=("mode_radio", "mode"))
+    top1, top2 = st.columns([5, 1], vertical_alignment="bottom")
+    with top1:
+        step_tracker(A is not None, n_pts)
     top2.button("↶ Undo", on_click=undo, disabled=not ss.history, width="stretch",
                 help="Undo the last change (points, datasets or calibration)")
+    ss.mode_radio = ss.mode
+    st.radio("Mode", MODES, key="mode_radio", horizontal=True, label_visibility="collapsed",
+             on_change=cb_copy, args=("mode_radio", "mode"))
     instruction(A is not None, cal_err)
 
     left, right = st.columns([3, 2], gap="large")
