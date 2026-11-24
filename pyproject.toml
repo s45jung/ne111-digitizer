@@ -5,7 +5,7 @@ description = "NE111 plot digitizer (Streamlit app)"
 requires-python = ">=3.12"
 dependencies = [
     "streamlit>=1.50",
-    "streamlit-image-coordinates>=0.1.9",
+    "streamlit-image-coordinates>=0.3",
     "pillow>=10.1",
     "numpy",
     "pandas",

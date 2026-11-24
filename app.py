@@ -53,7 +53,8 @@ MODES = [MODE_CAL, MODE_ADD, MODE_DEL]
 IMAGE_TYPES = ["png", "jpg", "jpeg", "gif", "tif", "tiff", "bmp", "webp"]
 # Widget values that must survive while their widget is not on screen.
 PERSIST_KEYS = ["xlabel", "ylabel", "xlog", "ylog", "X1_val", "X2_val", "Y1_val",
-                "Y2_val", "zoom", "pan_x", "pan_y", "disp_w", "sort_x", "connect"]
+                "Y2_val", "zoom", "pan_x", "pan_y", "sort_x", "connect"]
+RENDER_W = 1000  # pixel width the plot is drawn at before the browser scales it
 MAX_HISTORY = 100
 
 
@@ -270,7 +271,7 @@ def render_view(img, view, disp_w, calib, datasets, active, highlight=None, conn
     layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
     to_d = lambda p: ((p[0] - x0) * s, (p[1] - y0) * s)  # noqa: E731
-    font = _font(15)
+    font = _font(18)
 
     # Calibration axes and markers
     for p, q, col in (("X1", "X2", CAL_COLORS["X1"]), ("Y1", "Y2", CAL_COLORS["Y1"])):
@@ -281,7 +282,7 @@ def render_view(img, view, disp_w, calib, datasets, active, highlight=None, conn
             continue
         cx, cy = to_d(calib[k])
         col = CAL_COLORS[k]
-        r = 11 if k == highlight else 8
+        r = 14 if k == highlight else 10
         d.line([(cx - r, cy), (cx + r, cy)], fill=col, width=2)
         d.line([(cx, cy - r), (cx, cy + r)], fill=col, width=2)
         d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=2)
@@ -297,7 +298,7 @@ def render_view(img, view, disp_w, calib, datasets, active, highlight=None, conn
         pts = [to_d(p) for p in ds["points"]]
         if connect and len(pts) > 1:
             d.line(pts, fill=ds["color"] + "aa", width=2)
-        r = 6 if i == active else 4.5
+        r = 7 if i == active else 5.5
         for cx, cy in pts:
             d.ellipse([cx - r - 1.5, cy - r - 1.5, cx + r + 1.5, cy + r + 1.5], fill="#000000aa")
             d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=ds["color"], outline="white", width=2)
@@ -349,7 +350,7 @@ def init_state():
             ss[k] = ss[k]
     defaults = {"xlabel": "x", "ylabel": "y", "xlog": False, "ylog": False,
                 "X1_val": 0.0, "X2_val": 10.0, "Y1_val": 0.0, "Y2_val": 10.0,
-                "zoom": 1.0, "pan_x": 0.5, "pan_y": 0.5, "disp_w": 760,
+                "zoom": 1.0, "pan_x": 0.5, "pan_y": 0.5,
                 "sort_x": False, "connect": False, "img_hash": None, "use_sample": False}
     for k, v in defaults.items():
         ss.setdefault(k, v)
@@ -489,10 +490,10 @@ def sidebar_image() -> tuple[bytes | None, str]:
     if up is not None:
         return up.getvalue(), Path(up.name).stem
     c1, c2 = st.sidebar.columns(2)
-    c1.button("Try a sample plot", on_click=cb_set, kwargs={"use_sample": True},
+    c1.button("Sample plot", on_click=cb_set, kwargs={"use_sample": True},
               help="A semi-log plot scanned 3° crooked")
     if ss.use_sample:
-        c2.button("Close sample", on_click=cb_set, kwargs={"use_sample": False})
+        c2.button("Close it", on_click=cb_set, kwargs={"use_sample": False})
         return cached_sample(), "sample_plot"
     return None, ""
 
@@ -531,8 +532,6 @@ def sidebar_settings(img: Image.Image, info: dict):
         ImageDraw.Draw(thumb).rectangle(
             [x0 * k, y0 * k, (x0 + cw) * k, (y0 + ch) * k], outline="#ff2b2b", width=3)
         st.sidebar.image(thumb, caption="Visible region")
-    st.sidebar.slider("Display width (px)", 400, 1600, key="disp_w", step=20,
-                      help="Size of the image on screen")
     st.sidebar.checkbox("Connect points with lines", key="connect")
 
 
@@ -727,20 +726,19 @@ Extract numbers from a picture of a graph when the raw data isn't available.
 
 def image_panel(img: Image.Image, img_hash: str):
     view = compute_view(img.width, img.height, ss.zoom, ss.pan_x, ss.pan_y)
-    disp_w = int(ss.disp_w)
+    disp_w = RENDER_W
     highlight = ss.calib_next if ss.mode == MODE_CAL else None
     disp = render_view(img, view, disp_w, ss.calib, ss.datasets, ss.active, highlight, ss.connect)
-    kwargs = dict(key=f"img_{img_hash}", width=disp.width)
-    try:
-        value = streamlit_image_coordinates(disp, cursor="crosshair", **kwargs)
-    except TypeError:  # older component versions have no cursor option
-        value = streamlit_image_coordinates(disp, **kwargs)
+    # Rendered sharp at RENDER_W, then scaled by the browser to fit the column.
+    # The component reports the displayed width/height, used below to map back.
+    value = streamlit_image_coordinates(disp, key=f"img_{img_hash}",
+                                        use_column_width="always", cursor="crosshair")
     if value and value != ss.last_click:
         ss.last_click = value
         x0, y0, cw, ch = view
         sx = cw / (value.get("width") or disp.width)
         sy = ch / (value.get("height") or disp.height)
-        tol = 14 * sx
+        tol = 12 * sx
         handle_click(x0 + value["x"] * sx, y0 + value["y"] * sy, tol)
         st.rerun()
 
