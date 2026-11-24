@@ -472,7 +472,7 @@ def handle_click(px: float, py: float, tol: float):
 
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,400..900;1,400..900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400..900&display=swap');
 :root { --card:#1c1c1e; --card-hi:#2a2a2c; --line:#2c2c2e; --muted:#8e8e93; --soft:#c7c7cc; }
 .stApp p, .stApp label, .stApp button, .stApp input, .stApp textarea, .stApp li,
 .stApp h1, .stApp h2, .stApp h3, .stApp td, .stApp th, .dg-root { font-family:'Montserrat', sans-serif; }
@@ -485,7 +485,7 @@ section[data-testid="stSidebar"] { border-right:1px solid var(--line); }
              padding:.2rem 0 1.1rem; border-bottom:1px solid var(--line); margin-bottom:1.2rem; }
 .dg-eyebrow { text-align:center; letter-spacing:.25em; font-size:.85rem; font-weight:500;
               color:var(--soft); margin-top:2.5rem; }
-.dg-hero { text-align:center; font-weight:900; font-style:italic; text-transform:uppercase;
+.dg-hero { text-align:center; font-weight:800; text-transform:uppercase;
            font-size:clamp(1.8rem, 4vw, 3rem); line-height:1.08; letter-spacing:.01em;
            margin:.6rem auto 2.2rem; max-width:900px; }
 .dg-label { color:var(--soft); text-transform:uppercase; letter-spacing:.09em; font-size:.74rem;
@@ -501,7 +501,7 @@ section[data-testid="stSidebar"] { border-right:1px solid var(--line); }
               margin-top:.2rem; }
 .dg-card .grow { flex:1; min-width:0; }
 .dg-card .dots { color:var(--muted); letter-spacing:.1em; font-weight:700; }
-.dg-card .num { font-weight:900; font-style:italic; font-size:1.4rem; color:var(--muted); width:2.2rem; }
+.dg-card .num { font-weight:800; font-size:1.4rem; color:var(--muted); width:2.2rem; }
 .swatch { display:inline-block; width:.85rem; height:.85rem; border-radius:50%; flex:none;
           box-shadow:0 0 0 2px #000, 0 0 0 3px #555; }
 

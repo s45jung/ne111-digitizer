@@ -4,7 +4,7 @@ primaryColor = "#ffffff"
 backgroundColor = "#000000"
 secondaryBackgroundColor = "#1c1c1e"
 textColor = "#ffffff"
-font = "Montserrat:https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,400..900;1,400..900&display=swap"
+font = "Montserrat:https://fonts.googleapis.com/css2?family=Montserrat:wght@400..900&display=swap"
 borderColor = "#2c2c2e"
 baseRadius = "6px"
 
