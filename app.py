@@ -1006,6 +1006,7 @@ button[data-testid="stBaseButton-primary"] { background:#fff !important; color:#
 button[data-testid="stBaseButton-primary"] p { color:#000 !important; }
 button[data-testid="stBaseButton-primary"]:hover { background:#d9d9d9 !important; }
 .stButton button:disabled { opacity:.35; }
+.stButton button, [data-testid="stPopover"] button { padding-left:.5rem; padding-right:.5rem; }
 
 /* inputs and bordered containers */
 [data-baseweb="input"], [data-baseweb="select"] > div, [data-baseweb="textarea"] {
@@ -1181,7 +1182,7 @@ def instruction(calibrated, cal_err):
         else:
             name = ss.datasets[ss.active]["name"]
             banner(step, f"Click data points to add them to **{name}**. "
-                         "Use **+ New** for another curve.")
+                         "Use **+ New dataset** for another curve.")
     else:
         banner("Edit", "Click a point on the image to delete it.")
 
@@ -1250,12 +1251,11 @@ def dataset_cards():
 
 
 def datasets_panel(cal):
-    h1, h2 = st.columns([3, 1.2], vertical_alignment="bottom")
-    with h1:
-        label("Datasets", f"{len(ss.datasets)} total")
-    h2.button("+ New", on_click=cb_add_dataset, width="stretch", help="Add another dataset")
+    label("Datasets", f"{len(ss.datasets)} total")
     ss.active = min(ss.active, len(ss.datasets) - 1)
     dataset_cards()
+    st.button("+ New dataset", on_click=cb_add_dataset, width="stretch",
+              help="Add another dataset, e.g. for a second curve")
 
     ds = ss.datasets[ss.active]
     st.write("")
@@ -1267,7 +1267,7 @@ def datasets_panel(cal):
 
     b1, b2, b3 = st.columns(3)
     no_points = not ds["points"]
-    b1.button("↶ Last pt", on_click=cb_remove_points, args=(ss.active, True), width="stretch",
+    b1.button("↶ Last", on_click=cb_remove_points, args=(ss.active, True), width="stretch",
               disabled=no_points, help="Remove the last point of this dataset")
     b2.button("Clear", on_click=cb_remove_points, args=(ss.active, False), width="stretch",
               disabled=no_points, help="Remove all points of this dataset")
