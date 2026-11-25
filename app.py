@@ -53,6 +53,11 @@ WIDGET_DEFAULTS = {"xlabel": "x", "ylabel": "y", "xlog": False, "ylog": False,
                    "trace_n": 25, "trace_tol": 60, "adv_tools": False,
                    "round_prec": True, "x_step": "", "y_step": ""}
 PERSIST_KEYS = list(WIDGET_DEFAULTS)
+# Settings that describe one particular graph's axes: these go back to their
+# defaults when a new image is loaded. (Preferences like snapping are kept.)
+GRAPH_KEYS = ["xlabel", "ylabel", "xunit", "yunit", "xlog", "ylog",
+              "X1_val", "X2_val", "Y1_val", "Y2_val", "x_step", "y_step",
+              "zoom", "pan_x", "pan_y", "sort_x"]
 RENDER_W = 1200  # width the plot is drawn at before the browser scales it down
 MAX_HISTORY = 100
 
@@ -659,29 +664,38 @@ def follow_curve(lin, seed, step_x, step_y):
 
     path = {}
 
-    def walk(b, last_b, last, slope, direction):
+    def recent_slope(direction):
+        """Slope (y per slice) of a straight-line fit to the last 20 slices walked.
+
+        A fit over a stretch of curve isn't thrown off when the walk passes
+        through a marker, which is flatter and taller than the line itself.
+        """
+        keys = sorted(path)
+        keys = keys[-20:] if direction == 1 else keys[:20]
+        if len(keys) < 3:
+            return 0.0
+        return np.polyfit(keys, [path[k] for k in keys], 1)[0]
+
+    def walk(b, last_b, last, direction):
         while abs(b - last_b) < 15:  # 15 empty slices in a row: the curve has ended
             if b in slices:
                 gap = abs(b - last_b)
+                slope = recent_slope(direction)
                 guess = last + slope * (b - last_b)
                 blobs = slices[b]
                 best = blobs[np.argmin(np.abs(blobs - guess))]
                 # the allowed distance from the guess grows a little over gaps
-                if abs(best - guess) < (4 + 0.3 * gap) * step_y + abs(slope) * gap:
-                    if b != last_b:
-                        slope = 0.7 * slope + 0.3 * (best - last) / (b - last_b)
+                if abs(best - guess) < (8 + 0.5 * gap) * step_y + abs(slope) * gap:
                     path[b] = best
                     last_b, last = b, best
             b += direction
 
-    walk(0, 0, seed[1], 0.0, 1)  # to the right of the click...
+    walk(0, 0, seed[1], 1)  # to the right of the click...
     if not path:
         return np.empty((0, 2))
-    # ...then to the left, starting where the right-hand walk began, with its slope
+    # ...then to the left, starting where the right-hand walk began
     first = min(path)
-    start = sorted(path)[:10]
-    slope = np.polyfit(start, [path[k] for k in start], 1)[0] if len(start) >= 2 else 0.0
-    walk(first - 1, first, path[first], slope, -1)
+    walk(first - 1, first, path[first], -1)
 
     keys = sorted(path)
     return np.array([[seed[0] + (k + 0.5) * step_x, path[k]] for k in keys])
@@ -939,7 +953,8 @@ def reset_work():
     ss.history = []
     ss.last_click = None
     ss.editor_ver = 0
-    ss.zoom, ss.pan_x, ss.pan_y = 1.0, 0.5, 0.5
+    for k in GRAPH_KEYS:
+        ss[k] = WIDGET_DEFAULTS[k]
     ss.rotation = 0.0  # degrees the working image is rotated from the upload
 
 
