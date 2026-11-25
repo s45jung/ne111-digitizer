@@ -17,12 +17,16 @@ import io
 import math
 from pathlib import Path
 
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from scipy import ndimage
 from streamlit_image_coordinates import streamlit_image_coordinates
+
+matplotlib.use("Agg")  # matplotlib only draws to images here, never to a window
 
 
 # ---- Constants ----
@@ -52,7 +56,8 @@ GRAPH_DEFAULTS = {"xlabel": "x", "ylabel": "y", "xunit": "", "yunit": "",
                   "x_step": "", "y_step": "", "zoom": 1.0, "pan_x": 0.5, "pan_y": 0.5,
                   "sort_x": False}
 PREFERENCES = {"straighten": True, "snap": True, "show_grid": True, "connect": False,
-               "round_prec": True, "trace_n": 25, "trace_tol": 60, "adv_tools": False}
+               "round_prec": True, "trace_n": 25, "trace_tol": 60, "adv_tools": False,
+               "source": "Image"}
 WIDGET_DEFAULTS = {**GRAPH_DEFAULTS, **PREFERENCES}
 RENDER_W = 1200  # width the plot is drawn at before the browser scales it down
 MAX_HISTORY = 100
@@ -115,10 +120,6 @@ def decode_image(data):
 
 def make_sample_plot():
     """PNG bytes of a semi-log plot with two curves, scanned slightly crooked (3°)."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
     x = np.arange(0, 11)
     fig, ax = plt.subplots(figsize=(7, 5), dpi=110)
     ax.semilogy(x, 2 * np.exp(0.5 * x), "o-", color="black", label="Reactor A")
@@ -168,6 +169,19 @@ def to_axis(values, scale, name="Value"):
             raise ValueError(f"{name} can't be negative on a squared axis.")
         return v ** 2
     return v  # linear, and dates (in seconds)
+
+
+def to_axis_unchecked(values, scale):
+    """Like to_axis, but returns nan for values the scale can't show instead of an error
+    (matplotlib asks about values outside the data range too)."""
+    v = np.asarray(values, dtype=float)
+    if scale == RECIPROCAL:
+        return np.where(v != 0, 1 / np.where(v != 0, v, 1), np.nan)
+    if scale == SQRT:
+        return np.where(v >= 0, np.sqrt(np.abs(v)), np.nan)
+    if scale == SQUARED:
+        return np.where(v >= 0, v ** 2, np.nan)
+    return v
 
 
 def from_axis(positions, scale):
@@ -245,22 +259,27 @@ class Calibration:
         missing = [k for k in CAL_KEYS if px.get(k) is None]
         if missing:
             raise ValueError("Place calibration point(s): " + ", ".join(missing) + ".")
-        X1, X2, Y1, Y2 = [np.asarray(px[k], dtype=float) for k in CAL_KEYS]
-        scale_of = {"X1": xscale, "X2": xscale, "Y1": yscale, "Y2": yscale}
-        v = {k: float(to_axis(vals[k], scale_of[k], k)) for k in CAL_KEYS}
+        p = {k: np.asarray(px[k], dtype=float) for k in CAL_KEYS}
+        v = {k: float(to_axis(vals[k], xscale if k[0] == "X" else yscale, k)) for k in CAL_KEYS}
 
-        if v["X1"] == v["X2"]:
-            raise ValueError("X1 and X2 must have different values.")
-        if v["Y1"] == v["Y2"]:
-            raise ValueError("Y1 and Y2 must have different values.")
-        if np.allclose(X1, X2):
-            raise ValueError("X1 and X2 are at the same spot. Place them further apart.")
-        if np.allclose(Y1, Y2):
-            raise ValueError("Y1 and Y2 are at the same spot. Place them further apart.")
+        pairs = [("X1", "X2"), ("Y1", "Y2")]
+        for k1, k2 in pairs:
+            if v[k1] == v[k2]:
+                raise ValueError(f"{k1} and {k2} must have different values.")
+        for k1, k2 in pairs:
+            if np.allclose(p[k1], p[k2]):
+                raise ValueError(f"{k1} and {k2} are at the same spot. Place them further apart.")
+        # the two axes should be roughly at right angles; nearly parallel means a mis-click
+        xdir, ydir = p["X2"] - p["X1"], p["Y2"] - p["Y1"]
+        cross = xdir[0] * ydir[1] - xdir[1] * ydir[0]
+        sin_angle = abs(cross) / (np.linalg.norm(xdir) * np.linalg.norm(ydir))
+        if sin_angle < math.sin(math.radians(20)):
+            raise ValueError("The x-axis and y-axis points are almost parallel. "
+                             "Check that X1/X2 are on the x-axis and Y1/Y2 on the y-axis.")
 
         try:
-            a, b, c = fit_axis(X1, X2, Y2 - Y1, v["X1"], v["X2"])
-            d, e, f = fit_axis(Y1, Y2, X2 - X1, v["Y1"], v["Y2"])
+            a, b, c = fit_axis(p["X1"], p["X2"], p["Y2"] - p["Y1"], v["X1"], v["X2"])
+            d, e, f = fit_axis(p["Y1"], p["Y2"], p["X2"] - p["X1"], v["Y1"], v["Y2"])
         except np.linalg.LinAlgError:
             raise ValueError("The x-axis and y-axis points are parallel. "
                              "Check that X1/X2 are on the x-axis and Y1/Y2 on the y-axis.")
@@ -269,9 +288,10 @@ class Calibration:
             raise ValueError("Calibration is degenerate. Re-place the points.")
 
         self.A = A
+        self.A_inv = np.linalg.inv(A)  # for going back from values to pixels
         self.off = np.array([c, f])
         self.scales = [xscale, yscale]
-        self.centre = np.mean([X1, X2, Y1, Y2], axis=0)  # middle of the plot, roughly
+        self.centre = np.mean([p[k] for k in CAL_KEYS], axis=0)  # middle of the plot, roughly
 
     def to_linear(self, pts):
         """Pixel positions -> positions along each axis (the fitted space)."""
@@ -281,7 +301,7 @@ class Calibration:
     def from_linear(self, vals):
         """Positions along each axis -> pixel positions."""
         vals = np.asarray(vals, dtype=float).reshape(-1, 2)
-        return (vals - self.off) @ np.linalg.inv(self.A).T
+        return (vals - self.off) @ self.A_inv.T
 
     def to_data(self, pts):
         """Pixel positions (N x 2) -> data values (N x 2)."""
@@ -296,6 +316,11 @@ class Calibration:
         for col, (scale, name) in enumerate(zip(self.scales, ["x values", "y values"])):
             v[:, col] = to_axis(v[:, col], scale, name)
         return self.from_linear(v)
+
+
+def axis_lines(cal, calib):
+    """Where the clicked axes are in fitted space: (x of the y-axis, y of the x-axis)."""
+    return cal.to_linear([calib["Y1"]])[0, 0], cal.to_linear([calib["X1"]])[0, 1]
 
 
 def line_tilt(p, q, vertical):
@@ -493,6 +518,8 @@ def date_ticks(lo, hi):
         if s >= (hi - lo) / 8:
             step = s
             break
+    if (hi - lo) / step > 60:  # far too many to draw
+        return []
     return list(np.arange(math.ceil(lo / step) * step, hi + 1, step, dtype=float))
 
 
@@ -503,6 +530,8 @@ def axis_ticks(lo, hi, scale):
         return nice_ticks(lo, hi)
     if scale == DATE:
         return date_ticks(lo, hi)
+    if scale == LOG and hi - lo > 60:  # far too many decades to draw
+        return []
     if scale == LOG and hi - lo >= 1:  # whole decades: 1, 10, 100...
         return [float(k) for k in range(math.ceil(lo), math.floor(hi) + 1)]
     # other scales: round data values, then placed where they belong on the axis
@@ -529,9 +558,7 @@ def calibration_grid(cal, size, calib):
     corners = cal.to_linear([(0, 0), (w, 0), (0, h), (w, h)])
     xlo, xhi = corners[:, 0].min(), corners[:, 0].max()
     ylo, yhi = corners[:, 1].min(), corners[:, 1].max()
-    # labels go along the axes the user clicked
-    y_axis_line = cal.to_linear([calib["X1"]])[0, 1]
-    x_axis_line = cal.to_linear([calib["Y1"]])[0, 0]
+    y_axis_x, x_axis_y = axis_lines(cal, calib)  # labels go along the clicked axes
 
     lines = []
     for axis, (lo, hi), scale in [("x", (xlo, xhi), cal.scales[0]), ("y", (ylo, yhi), cal.scales[1])]:
@@ -539,10 +566,10 @@ def calibration_grid(cal, size, calib):
             text = fmt_value(float(from_axis(v, scale)), scale)
             if axis == "x":
                 ends = cal.from_linear([(v, ylo), (v, yhi)])
-                spot = cal.from_linear([(v, y_axis_line)])[0]
+                spot = cal.from_linear([(v, x_axis_y)])[0]
             else:
                 ends = cal.from_linear([(xlo, v), (xhi, v)])
-                spot = cal.from_linear([(x_axis_line, v)])[0]
+                spot = cal.from_linear([(y_axis_x, v)])[0]
             lines.append((tuple(ends[0]), tuple(ends[1]), text, tuple(spot), axis))
     return lines
 
@@ -664,8 +691,21 @@ def round_to_step(v, step):
     """
     if not step > 0 or not math.isfinite(step):
         return v
-    p = 10 ** math.floor(math.log10(step))
-    return float(f"{round(v / p) * p:.12g}")  # .12g drops float noise like 40.300000000000004
+    return round_multiple(v, 10 ** math.floor(math.log10(step)))
+
+
+def round_multiple(v, step):
+    """v rounded to the nearest multiple of step."""
+    return float(f"{round(v / step) * step:.12g}")  # .12g drops float noise like 40.300000000000004
+
+
+def round_time(seconds, step):
+    """Round a date to the whole second, minute, hour or day that one pixel (step) allows."""
+    unit = 1
+    for u in [60, 3600, 86400]:
+        if u <= step:
+            unit = u
+    return round(seconds / unit) * unit
 
 
 def pixel_step(cal, col, v):
@@ -683,23 +723,16 @@ def clean_values(data, cal, round_prec, x_step, y_step):
     """Tidy digitized values: snap to multiples of x_step / y_step (if given),
     otherwise round to the precision one pixel of the image allows."""
     data = np.array(data, dtype=float).reshape(-1, 2)
-    steps = [x_step, y_step]
-    for col in range(2):
+    for col, (step, scale) in enumerate(zip([x_step, y_step], cal.scales)):
         for i, v in enumerate(data[:, col]):
             if not math.isfinite(v):
                 continue
-            if steps[col] and cal.scales[col] != DATE:
-                data[i, col] = float(f"{round(v / steps[col]) * steps[col]:.12g}")
+            if step and scale != DATE:
+                data[i, col] = round_multiple(v, step)
+            elif round_prec and scale == DATE:
+                data[i, col] = round_time(v, pixel_step(cal, col, v))
             elif round_prec:
-                step = pixel_step(cal, col, v)
-                if cal.scales[col] == DATE:  # round to a whole second/minute/hour/day
-                    unit = 1
-                    for u in [60, 3600, 86400]:
-                        if u <= step:
-                            unit = u
-                    data[i, col] = round(v / unit) * unit
-                else:
-                    data[i, col] = round_to_step(v, step)
+                data[i, col] = round_to_step(v, pixel_step(cal, col, v))
     return data
 
 
@@ -836,8 +869,7 @@ def trace_curve(img, ink, click, cal, calib, n_points, tol=60):
     # only keep the plot side of each axis (drops tick labels, axis titles...)
     rows, cols = np.nonzero(mask)
     lin = cal.to_linear(np.column_stack([cols + 0.5, rows + 0.5]))
-    axis_x = cal.to_linear([calib["Y1"]])[0, 0]  # the y-axis is at this x
-    axis_y = cal.to_linear([calib["X1"]])[0, 1]  # the x-axis is at this y
+    axis_x, axis_y = axis_lines(cal, calib)
     seed = cal.to_linear([(px + 0.5, py + 0.5)])[0]
     keep = ((np.sign(lin[:, 0] - axis_x) == np.sign(seed[0] - axis_x))
             & (np.sign(lin[:, 1] - axis_y) == np.sign(seed[1] - axis_y)))
@@ -857,21 +889,12 @@ def trace_curve(img, ink, click, cal, calib, n_points, tol=60):
     return tuple(int(c) for c in colour), cal.from_linear(np.column_stack([xs, ys]))
 
 
-def axis_title(label, unit):
-    """"Time" and "h" -> "Time (h)"; no unit -> just the label."""
-    label, unit = label.strip(), unit.strip()
-    return f"{label} ({unit})" if unit else label
-
-
 # ---- Re-plotting the result ----
 
 def make_replot(export, xlabel, ylabel, xscale, yscale):
     """Matplotlib figure of the digitized data on the same kind of axes as the original."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
     def column(values, scale):
+        """Dates become datetimes so matplotlib labels them as dates."""
         values = np.asarray(values, dtype=float)
         return pd.to_datetime(values, unit="s") if scale == DATE else values
 
@@ -889,6 +912,7 @@ def make_replot(export, xlabel, ylabel, xscale, yscale):
         if scale == LOG:
             set_scale("log")
         elif scale in (RECIPROCAL, SQRT, SQUARED):
+            # a custom scale needs both directions: value -> position and back
             def forward(v, scale=scale):
                 with np.errstate(all="ignore"):
                     return to_axis_unchecked(v, scale)
@@ -912,23 +936,115 @@ def make_replot(export, xlabel, ylabel, xscale, yscale):
     return buf.getvalue()
 
 
-def to_axis_unchecked(values, scale):
-    """Like to_axis, but returns nan for values the scale can't show instead of an error
-    (matplotlib asks about values outside the data range too)."""
-    v = np.asarray(values, dtype=float)
-    if scale == RECIPROCAL:
-        return np.where(v != 0, 1 / np.where(v != 0, v, 1), np.nan)
-    if scale == SQRT:
-        return np.where(v >= 0, np.sqrt(np.abs(v)), np.nan)
-    if scale == SQUARED:
-        return np.where(v >= 0, v ** 2, np.nan)
-    return v
+# ---- Plotting a CSV file ----
+
+def to_float(text):
+    """A CSV cell as a number, or None if it's blank or not a number."""
+    try:
+        return float(str(text).replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def read_csv_datasets(text):
+    """Read a CSV into datasets: [{"name", "data": [[x, y], ...]}], plus x and y labels.
+
+    Three layouts are understood:
+    1. This app's own export: row 1 dataset names, row 2 axis labels, then x, y pairs.
+    2. A plain table: a header row, the first column is x, every other column is a line.
+    3. Just numbers (no header): first column x, the others are lines.
+    """
+    rows = [row for row in csv.reader(io.StringIO(text)) if any(c.strip() for c in row)]
+    if len(rows) < 2:
+        raise ValueError("The file needs at least two rows.")
+    width = max(len(row) for row in rows)
+    rows = [row + [""] * (width - len(row)) for row in rows]  # pad short rows
+    if width < 2:
+        raise ValueError("The file needs at least two columns (x and y).")
+
+    first_is_text = any(to_float(c) is None and c.strip() for c in rows[0])
+    second_is_text = any(to_float(c) is None and c.strip() for c in rows[1])
+    pairs_layout = (width % 2 == 0 and first_is_text and second_is_text
+                    and all(not rows[0][i].strip() for i in range(1, width, 2)))
+
+    datasets = []
+    if pairs_layout:  # layout 1: name, blank, name, blank...
+        xlabel, ylabel = rows[1][0].strip() or "x", rows[1][1].strip() or "y"
+        for i in range(0, width, 2):
+            data = []
+            for row in rows[2:]:
+                x, y = to_float(row[i]), to_float(row[i + 1])
+                if x is not None and y is not None:
+                    data.append([x, y])
+            datasets.append({"name": rows[0][i].strip() or f"Dataset {i // 2 + 1}", "data": data})
+    else:  # layouts 2 and 3: x column + one column per line
+        if first_is_text:
+            header, body = rows[0], rows[1:]
+        else:
+            header, body = ["x"] + [f"Dataset {i}" for i in range(1, width)], rows
+        xlabel = header[0].strip() or "x"
+        ylabel = header[1].strip() if width == 2 else "y"
+        for col in range(1, width):
+            data = []
+            for row in body:
+                x, y = to_float(row[0]), to_float(row[col])
+                if x is not None and y is not None:
+                    data.append([x, y])
+            datasets.append({"name": header[col].strip() or f"Dataset {col}", "data": data})
+
+    datasets = [ds for ds in datasets if ds["data"]]
+    if not datasets:
+        raise ValueError("Couldn't find any numbers to plot.")
+    return datasets, xlabel, ylabel
+
+
+def make_csv_plot(datasets, xlabel, ylabel, title, xscale, yscale, style):
+    """A clean matplotlib plot of the datasets (white background, like a textbook figure)."""
+    fig, ax = plt.subplots(figsize=(7.5, 5), dpi=110)
+    for i, ds in enumerate(datasets):
+        data = np.asarray(ds["data"], dtype=float)
+        ax.plot(data[:, 0], data[:, 1], style, color=PALETTE[i % len(PALETTE)], label=ds["name"])
+    if xscale == LOG:
+        ax.set_xscale("log")
+    if yscale == LOG:
+        ax.set_yscale("log")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+    ax.grid(True, which="both", alpha=0.3)
+    if len(datasets) > 1:
+        ax.legend()
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+# a small example CSV (two lines from a lab), for trying the CSV tab
+SAMPLE_CSV = """Time (s),Heating,Cooling
+0,20.0,100.0
+10,52.0,79.0
+20,70.3,62.6
+30,80.8,49.9
+40,86.9,39.9
+50,90.3,32.2
+60,92.3,26.2
+"""
 
 
 # ---- CSV export ----
 
 def fmt(v):
+    """A number as text with 6 significant figures, the way it goes in the CSV."""
     return f"{v:.6g}"
+
+
+def axis_title(label, unit):
+    """"Time" and "h" -> "Time (h)"; no unit -> just the label."""
+    label, unit = label.strip(), unit.strip()
+    return f"{label} ({unit})" if unit else label
 
 
 def csv_rows(datasets, xlabel, ylabel, xscale=LINEAR, yscale=LINEAR):
@@ -958,6 +1074,7 @@ def csv_rows(datasets, xlabel, ylabel, xscale=LINEAR, yscale=LINEAR):
 
 
 def rows_to_text(rows):
+    """CSV rows -> the text of the CSV file."""
     out = io.StringIO()
     csv.writer(out, lineterminator="\n").writerows(rows)
     return out.getvalue()
@@ -966,6 +1083,7 @@ def rows_to_text(rows):
 # ---- Drawing ----
 
 def load_font(size):
+    """Pillow's built-in font at the given size."""
     try:
         return ImageFont.load_default(size=size)
     except TypeError:  # older Pillow can't resize the default font
@@ -1061,16 +1179,14 @@ def new_dataset():
     ss.ds_counter = ss.get("ds_counter", 0) + 1
     n = ss.ds_counter
     used = {ds["color"] for ds in ss.get("datasets", [])}
-    color = PALETTE[(n - 1) % len(PALETTE)]  # if every colour is taken
-    for c in PALETTE:
-        if c not in used:
-            color = c
-            break
+    free = [c for c in PALETTE if c not in used]
+    color = free[0] if free else PALETTE[(n - 1) % len(PALETTE)]
     ss.uid_counter = ss.get("uid_counter", 0) + 1  # never reset, so ids are never reused
     return {"uid": f"d{ss.uid_counter}", "name": f"Dataset {n}", "color": color, "points": []}
 
 
 def clear_calibration():
+    """Remove all four calibration points and go back to calibrating."""
     ss.calib = {k: None for k in CAL_KEYS}
     ss.calib_next = "X1"
     ss.mode = MODE_CAL
@@ -1092,13 +1208,13 @@ def reset_work():
 
 
 def init_state():
+    """Fill in session state on the first run, and keep widget values on later runs."""
     for k, v in WIDGET_DEFAULTS.items():
-        if k in ss:
-            ss[k] = ss[k]  # keeps the value alive while its widget is hidden
-        else:
-            ss[k] = v
+        ss[k] = ss.get(k, v)  # re-assigning keeps the value alive while its widget is hidden
     ss.setdefault("img_hash", None)
     ss.setdefault("use_sample", False)
+    ss.setdefault("use_sample_csv", False)
+    ss.setdefault("generated", None)  # (png bytes, name) of a graph made from a CSV
     if "datasets" not in ss:
         reset_work()
 
@@ -1112,6 +1228,7 @@ def snapshot():
 
 
 def undo():
+    """Go back to the last snapshot."""
     if ss.history:
         snap = ss.history.pop()
         for k, v in snap.items():
@@ -1120,8 +1237,8 @@ def undo():
 
 
 def scale_of(k):
-    """The scale chosen for the axis that calibration point k ("X1", "Y2"...) is on."""
-    return ss.xscale if k[0] == "X" else ss.yscale
+    """The scale chosen for the axis that k ("X1", "Y2", "x_step"...) belongs to."""
+    return ss.xscale if k[0] in "Xx" else ss.yscale
 
 
 def current_calibration():
@@ -1162,18 +1279,25 @@ def change_rotation(data, new_angle):
 # ---- Callbacks ----
 
 def cb_copy(src, dst):
+    """Copy a widget's value into the real setting (or back)."""
     ss[dst] = ss[src]
 
 
 def cb_set(**kw):
+    """Set session-state values, e.g. cb_set(mode=MODE_ADD)."""
     for k, v in kw.items():
         ss[k] = v
 
 
-def cb_add_dataset():
-    snapshot()
+def add_dataset():
+    """Add an empty dataset and make it the active one."""
     ss.datasets.append(new_dataset())
     ss.active = len(ss.datasets) - 1
+
+
+def cb_add_dataset():
+    snapshot()
+    add_dataset()
     ss.mode = MODE_ADD
 
 
@@ -1308,7 +1432,12 @@ def colour_dot(hex_colour):
     return best
 
 
-# ---- Sidebar ----
+# ---- Caching ----
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def cached_csv_plot(datasets, xlabel, ylabel, title, xscale, yscale, style):
+    return make_csv_plot(datasets, xlabel, ylabel, title, xscale, yscale, style)
+
 
 @st.cache_data(show_spinner=False)
 def cached_sample():
@@ -1348,22 +1477,46 @@ def cached_ink(data, angle):
     return ink_map(cached_rotate(data, angle))
 
 
-def sidebar_image():
-    """File uploader / sample buttons. Returns (image bytes or None, file name stem)."""
-    st.sidebar.header("Image")
+# ---- Sidebar ----
+
+def sidebar_source():
+    """What to work on. Returns ("image" or "csv", the file's bytes or text, a file name),
+    or (None, None, "") if nothing is loaded yet."""
+    st.sidebar.header("Start from")
+    st.sidebar.radio("Start from", ["Image", "CSV file"], key="source", horizontal=True,
+                     label_visibility="collapsed")
+    c1, c2 = None, None
+    if ss.source == "CSV file":
+        up = st.sidebar.file_uploader(
+            "Upload a CSV", type=["csv", "txt"], label_visibility="collapsed",
+            help="Either this app's own export, or a table with x in the first column "
+                 "and one column per line")
+        if up is not None:
+            return "csv", up.getvalue().decode("utf-8-sig", errors="replace"), Path(up.name).stem
+        c1, c2 = st.sidebar.columns(2)
+        c1.button("Sample", on_click=cb_set, kwargs={"use_sample_csv": True}, width="stretch",
+                  help="Two temperature curves from a lab")
+        if ss.use_sample_csv:
+            c2.button("Close", on_click=cb_set, kwargs={"use_sample_csv": False}, width="stretch")
+            return "csv", SAMPLE_CSV, "sample_data"
+        return None, None, ""
+
     up = st.sidebar.file_uploader(
         "Upload a plot image", type=IMAGE_TYPES, label_visibility="collapsed",
         help="PNG, JPG, GIF, TIFF, BMP or WebP. Colour or greyscale.")
     if up is not None:
-        return up.getvalue(), Path(up.name).stem
-
+        return "image", up.getvalue(), Path(up.name).stem
     c1, c2 = st.sidebar.columns(2)
+    if ss.generated is not None:  # a graph made in the CSV tab
+        c1.button("Close", on_click=cb_set, kwargs={"generated": None}, width="stretch",
+                  help="Stop digitizing the graph made from your CSV")
+        return "image", ss.generated[0], ss.generated[1]
     c1.button("Sample", on_click=cb_set, kwargs={"use_sample": True}, width="stretch",
               help="A semi-log plot scanned 3° crooked")
     if ss.use_sample:
         c2.button("Close", on_click=cb_set, kwargs={"use_sample": False}, width="stretch")
-        return cached_sample(), "sample_plot"
-    return None, ""
+        return "image", cached_sample(), "sample_plot"
+    return None, None, ""
 
 
 def times_text(z):
@@ -1610,13 +1763,13 @@ def datasets_panel(cal):
     vals = cleaned(cal, pix)
     df = pd.DataFrame()
     config = {}
-    for col, (name, title, scale) in enumerate(zip(["x", "y"], titles(), cal.scales)):
+    for col, (axis, title, scale) in enumerate(zip(["x", "y"], titles(), cal.scales)):
         if scale == DATE:  # dates are shown and typed as text
-            df[name] = [fmt_value(v, DATE) for v in vals[:, col]]
-            config[name] = st.column_config.TextColumn(title)
+            df[axis] = [fmt_value(v, DATE) for v in vals[:, col]]
+            config[axis] = st.column_config.TextColumn(title)
         else:
-            df[name] = [float(fmt(v)) for v in vals[:, col]]
-            config[name] = st.column_config.NumberColumn(title, format="%.6g")
+            df[axis] = [float(fmt(v)) for v in vals[:, col]]
+            config[axis] = st.column_config.NumberColumn(title, format="%.6g")
     edited = st.data_editor(df, key=f"ed_{ds['uid']}_{ss.editor_ver}", num_rows="dynamic",
                             width="stretch", height=min(38 + 35 * (len(df) + 1), 360),
                             column_config=config)
@@ -1626,8 +1779,8 @@ def datasets_panel(cal):
 def table_numbers(frame, scales):
     """The table's x and y columns as numbers (dates back to seconds; blanks -> nan)."""
     out = np.full((len(frame), 2), np.nan)
-    for col, (name, scale) in enumerate(zip(["x", "y"], scales)):
-        for i, v in enumerate(frame[name]):
+    for col, (axis, scale) in enumerate(zip(["x", "y"], scales)):
+        for i, v in enumerate(frame[axis]):
             if v is None or str(v).strip() in ("", "nan", "None"):
                 continue
             out[i, col] = parse_date(v) if scale == DATE else float(v)
@@ -1650,9 +1803,10 @@ def apply_table_edits(ds, df, edited, pix, cal):
     new_pts = []
     try:
         for row, idx in enumerate(edited.index):
-            if idx in df.index and np.allclose(new[row], old[df.index.get_loc(idx)]):
+            old_row = df.index.get_loc(idx) if idx in df.index else None
+            if old_row is not None and np.allclose(new[row], old[old_row]):
                 # row not changed: keep the exact clicked pixel, not the rounded value
-                new_pts.append(list(pix[df.index.get_loc(idx)]))
+                new_pts.append(list(pix[old_row]))
             else:
                 new_pts.append(list(cal.to_pixel([new[row]])[0]))
     except ValueError as e:
@@ -1676,17 +1830,18 @@ def unique_names(names):
 
 def clean_up_card(cal):
     """Options that stop mouse wobble showing up as extra digits (0.0124 instead of 0)."""
+    precision = precision_text(cal)
     with st.container(border=True):
         c1, c2, c3 = st.columns([2, 1, 1], vertical_alignment="bottom")
         c1.checkbox("Round to image precision", key="round_prec",
                     help="Drops digits finer than one pixel of the image, "
-                         f"which are just mouse wobble. One pixel here is {precision_text(cal)}.")
-        c1.caption(f"One pixel = {precision_text(cal)}")
+                         f"which are just mouse wobble. One pixel here is {precision}.")
+        c1.caption(f"One pixel = {precision}")
         for col, k, name in [(c2, "x_step", "x"), (c3, "y_step", "y")]:
             col.text_input(f"Snap {name} to multiples of", key=k, placeholder="off",
                            help=f"For data taken at round {name} values (e.g. 1 or 0.5). "
                                 "Leave blank to turn off.")
-            if (ss.xscale if name == "x" else ss.yscale) == DATE:
+            if scale_of(k) == DATE:
                 col.caption("not used on a date axis")
             elif ss[k].strip():
                 try:
@@ -1741,6 +1896,52 @@ def results_section(cal, file_stem):
         st.image(cached_replot(filled, xtitle, ytitle, ss.xscale, ss.yscale))
 
 
+CSV_STYLES = {"Lines and markers": "o-", "Markers only": "o", "Lines only": "-"}
+
+
+def cb_digitize_graph(png, name):
+    """Send the graph made from a CSV over to the digitizer (a handy self-test)."""
+    ss.generated = (png, name)
+    ss.source = "Image"
+
+
+def csv_page(text, stem):
+    """Turn an uploaded CSV into a graph."""
+    st.subheader("Graph from a CSV file")
+    try:
+        datasets, xlabel, ylabel = read_csv_datasets(text)
+    except ValueError as e:
+        st.error(f"Couldn't read this CSV: {e}")
+        return
+    found = ", ".join(f"{ds['name']} ({len(ds['data'])} points)" for ds in datasets)
+    st.caption(f"Found {len(datasets)} dataset{'s' if len(datasets) > 1 else ''}: {found}")
+
+    left, right = st.columns([5, 3], gap="medium")
+    with right:
+        tag = hash(text)  # new file -> boxes start from that file's labels
+        title = st.text_input("Title", key=f"csv_title_{tag}")
+        xlabel = st.text_input("x-axis label", value=xlabel, key=f"csv_x_{tag}")
+        ylabel = st.text_input("y-axis label", value=ylabel, key=f"csv_y_{tag}")
+        c1, c2 = st.columns(2)
+        xscale = c1.selectbox("x-axis scale", [LINEAR, LOG], key="csv_xscale")
+        yscale = c2.selectbox("y-axis scale", [LINEAR, LOG], key="csv_yscale")
+        style = st.selectbox("Style", list(CSV_STYLES), key="csv_style")
+        for name, scale, col in [("x", xscale, 0), ("y", yscale, 1)]:
+            if scale == LOG and any(row[col] <= 0 for ds in datasets for row in ds["data"]):
+                st.warning(f"Some {name} values are 0 or negative, so they can't be shown on a log axis.")
+
+    png = cached_csv_plot(datasets, xlabel, ylabel, title, xscale, yscale, CSV_STYLES[style])
+    with left:
+        st.image(png)
+    with right:
+        st.download_button("Download graph (PNG)", png, file_name=f"{stem}_graph.png",
+                           mime="image/png", width="stretch")
+        st.button("Digitize this graph →", type="primary", width="stretch",
+                  on_click=cb_digitize_graph, args=(png, f"{stem}_graph"),
+                  help="Open the graph in the digitizer, e.g. to test how accurate it is: "
+                       "you know the true values")
+
+
 def welcome():
     st.title("Plot Digitizer")
     st.subheader("Turn any graph into data you can use")
@@ -1757,7 +1958,8 @@ def welcome():
                 st.caption(text)
         st.button("Try a sample plot", type="primary", width="stretch",
                   on_click=cb_set, kwargs={"use_sample": True})
-        st.caption("Or upload your own image in the sidebar.")
+        st.caption("Or upload your own image in the sidebar, or switch it to "
+                   "**CSV file** to turn a table of numbers into a graph.")
 
 
 def trace_click(img, data, cal, px, py):
@@ -1773,8 +1975,7 @@ def trace_click(img, data, cal, px, py):
         return
     snapshot()
     if ss.datasets[ss.active]["points"]:
-        ss.datasets.append(new_dataset())
-        ss.active = len(ss.datasets) - 1
+        add_dataset()
     ds = ss.datasets[ss.active]
     ds["points"] = [[float(x), float(y)] for x, y in pts]
     ss.editor_ver += 1
@@ -1800,10 +2001,10 @@ def image_panel(img, img_hash, data, cal):
         if ss.mode == MODE_TRACE:
             trace_click(img, data, cal, px, py)
             st.rerun()
-        if ss.mode == MODE_CAL and ss.snap:
+        if ss.snap and ss.mode == MODE_CAL:
             px, py = nearest_tick(cached_ticks(data, ss.rotation), px, py,
                                   radius=max(8.0, 0.015 * img.width))
-        if ss.mode == MODE_ADD and ss.snap:
+        elif ss.snap and ss.mode == MODE_ADD:
             px, py = snap_to_marker(cached_ink(data, ss.rotation), px, py,
                                     radius=max(5.0, 0.012 * img.width))
         # delete tolerance is about 1.5% of the visible width
@@ -1815,11 +2016,14 @@ def main():
     st.set_page_config(page_title="Plot Digitizer", page_icon="📈", layout="wide")
     init_state()
 
-    data, stem = sidebar_image()
+    kind, data, stem = sidebar_source()
     if data is None:
         welcome()
         return
     st.title("Plot Digitizer")
+    if kind == "csv":
+        csv_page(data, stem)
+        return
 
     img_hash = hash(data)  # same bytes -> same number, so we can tell when the image changes
     if ss.img_hash != img_hash:  # new image, so start fresh
