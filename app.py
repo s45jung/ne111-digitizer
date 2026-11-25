@@ -967,6 +967,7 @@ section[data-testid="stSidebar"] { border-right:1px solid var(--line); }
 
 /* instruction banner */
 .dg-banner { background:var(--card); border-radius:6px; padding:.85rem 1.1rem; margin:.2rem 0 1rem;
+             min-height:5.6rem; /* same height whatever the message, so the image never jumps */
              border-left:3px solid #fff; }
 .dg-banner.warn { border-left-color:#ff9f0a; }
 .dg-banner.ok { border-left-color:#30d158; }
