@@ -22,6 +22,7 @@ import uuid
 from pathlib import Path
 
 import numpy as np
+from scipy import ndimage
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -156,8 +157,8 @@ CAL_HELP = {
     "Y1": "a point on the **y-axis** whose value you know (e.g. the lowest labelled tick)",
     "Y2": "a second **y-axis** point, as far from Y1 as possible",
 }
-MODE_CAL, MODE_ADD, MODE_DEL = "Calibrate", "Add points", "Delete points"
-MODES = [MODE_CAL, MODE_ADD, MODE_DEL]
+MODE_CAL, MODE_ADD, MODE_TRACE, MODE_DEL = "Calibrate", "Add points", "Auto-trace", "Delete points"
+MODES = [MODE_CAL, MODE_ADD, MODE_TRACE, MODE_DEL]
 IMAGE_TYPES = ["png", "jpg", "jpeg", "gif", "tif", "tiff", "bmp", "webp"]
 
 # Starting values for the widgets. Streamlit forgets a widget's value when the
@@ -166,7 +167,8 @@ WIDGET_DEFAULTS = {"xlabel": "x", "ylabel": "y", "xlog": False, "ylog": False,
                    "X1_val": "0", "X2_val": "10", "Y1_val": "0", "Y2_val": "10",
                    "zoom": 1.0, "pan_x": 0.5, "pan_y": 0.5, "sort_x": False,
                    "connect": False, "magnify": 3.0, "straighten": True,
-                   "snap": True, "show_grid": True}
+                   "snap": True, "show_grid": True, "xunit": "", "yunit": "",
+                   "trace_n": 25, "trace_tol": 60, "adv_tools": False}
 PERSIST_KEYS = list(WIDGET_DEFAULTS)
 RENDER_W = 1200  # width the plot is drawn at before the browser scales it down
 MAX_HISTORY = 100
@@ -560,6 +562,203 @@ def calibration_grid(cal, size, calib):
     return lines
 
 
+# ---- Finding the axes automatically ----
+
+def tick_centres(band, skip, lo, hi):
+    """Tick marks along one side of an axis.
+
+    band: dark-pixel counts per column (or row) in a 4-pixel strip beside the
+    axis. A tick fills (almost) the whole strip. skip: frame lines to ignore.
+    """
+    strong = band >= 3
+    for c in skip:
+        strong[max(0, c - 2): c + 3] = False
+    strong[:max(0, lo)] = False
+    strong[hi:] = False
+    labels, n = ndimage.label(strong)
+    if n == 0:
+        return []
+    centres = ndimage.center_of_mass(strong, labels, range(1, n + 1))
+    return [c[0] + 0.5 for c in centres]
+
+
+def regular_ticks(cands, tol=2.5):
+    """Longest run of evenly spaced positions among the candidates.
+
+    Real tick marks are evenly spaced (decades too, on a log axis); stray hits
+    from a curve or a label usually aren't, so they get left out.
+    """
+    cands = sorted(set(round(c, 1) for c in cands))
+    best = cands[:1]
+    for i, a in enumerate(cands):
+        for b in cands[i + 1:]:
+            step = b - a
+            if step < 8:  # too close together to be separate ticks
+                continue
+            run = [a, b]
+            for c in cands:
+                if c > run[-1] and abs(c - (run[-1] + step)) <= tol:
+                    run.append(c)
+            longer = len(run) > len(best)
+            wider = len(run) == len(best) and run[-1] - run[0] > best[-1] - best[0]
+            if longer or wider:
+                best = run
+    return best
+
+
+def detect_axes(img):
+    """Suggest pixel positions for X1, X2, Y1, Y2 on a (straightened) plot.
+
+    The x-axis is the lowest long horizontal line and the y-axis the left-most
+    long vertical line. X1/X2 go on the first and last tick mark along the
+    x-axis, Y1/Y2 on the lowest and highest along the y-axis.
+    """
+    dark = np.asarray(img.convert("L")) < 160
+    rows, cols = dark.sum(axis=1), dark.sum(axis=0)
+    if rows.max() < 0.3 * dark.shape[1] or cols.max() < 0.3 * dark.shape[0]:
+        raise ValueError("Couldn't find the axis lines. Place the points by hand.")
+    long_rows = np.nonzero(rows >= 0.6 * rows.max())[0]
+    long_cols = np.nonzero(cols >= 0.6 * cols.max())[0]
+    xr, yc = int(long_rows.max()), int(long_cols.min())
+    x_end = int(np.nonzero(dark[xr])[0].max()) + 1
+    y_top = int(np.nonzero(dark[:, yc])[0].min())
+
+    # ticks may point out of the plot or into it: try a strip on each side
+    x_ticks, y_ticks = [], []
+    for off, skip in [(2, []), (-6, long_cols)]:
+        found = tick_centres(dark[xr + off: xr + off + 4, :].sum(axis=0), skip, yc - 2, x_end + 2)
+        if len(found) > len(x_ticks):
+            x_ticks = found
+    for off, skip in [(2, []), (-6, long_rows)]:
+        found = tick_centres(dark[:, yc - off - 3: yc - off + 1].sum(axis=1), skip, y_top - 2, xr + 3)
+        if len(found) > len(y_ticks):
+            y_ticks = found
+    # where the axes cross is often a tick too (e.g. the origin)
+    x_ticks = regular_ticks(x_ticks + [yc + 0.5])
+    y_ticks = regular_ticks(y_ticks + [xr + 0.5])
+    if len(x_ticks) < 2:  # no ticks: use the ends of the axis line instead
+        x_ticks = [yc + 0.5, x_end - 0.5]
+    if len(y_ticks) < 2:
+        y_ticks = [y_top + 0.5, xr + 0.5]
+    return {"X1": (x_ticks[0], xr + 0.5), "X2": (x_ticks[-1], xr + 0.5),
+            "Y1": (yc + 0.5, y_ticks[-1]), "Y2": (yc + 0.5, y_ticks[0])}
+
+
+# ---- Tracing a curve automatically ----
+
+def remove_long_lines(mask, frac=0.25):
+    """Blank out long horizontal/vertical runs (axes, frame) and the ticks on them."""
+    out = mask.copy()
+    h, w = mask.shape
+    for axis, length in [(1, int(frac * w)), (0, int(frac * h))]:
+        # a pixel is in a long line if a window of `length` around it is all on
+        full = ndimage.convolve1d(mask.astype(int), np.ones(length), axis=axis,
+                                  mode="constant") >= length
+        line = ndimage.maximum_filter1d(full, length, axis=axis)
+        out &= ~ndimage.binary_dilation(line, iterations=6)
+    return out
+
+
+def follow_curve(lin, seed, step_x, step_y):
+    """Walk along the curve one pixel-wide slice at a time, starting at the click.
+
+    lin: the curve's pixels in fitted (x, y) space. In each slice they may form
+    several separate blobs (a marker, another curve crossing, a stray label);
+    we take the blob closest to where the curve is heading, so the walk stays
+    on the curve that was clicked.
+    """
+    bins = np.floor((lin[:, 0] - seed[0]) / step_x).astype(int)
+    order = np.argsort(bins)
+    bins, ys = bins[order], lin[order, 1]
+    edges = np.nonzero(np.diff(bins))[0] + 1
+    slices = {}
+    for b, y in zip(bins[np.r_[0, edges]], np.split(ys, edges)):
+        y = np.sort(y)
+        gaps = np.nonzero(np.diff(y) > 3 * step_y)[0] + 1  # split into separate blobs
+        slices[int(b)] = [blob.mean() for blob in np.split(y, gaps)]
+
+    path = {}
+
+    def walk(b, last_b, last, slope, direction):
+        while abs(b - last_b) < 15:  # 15 empty slices in a row: the curve has ended
+            if b in slices:
+                gap = abs(b - last_b)
+                guess = last + slope * (b - last_b)
+                best = min(slices[b], key=lambda c: abs(c - guess))
+                # the allowed distance from the guess grows a little over gaps
+                if abs(best - guess) < (4 + 0.3 * gap) * step_y + abs(slope) * gap:
+                    if b != last_b:
+                        slope = 0.7 * slope + 0.3 * (best - last) / (b - last_b)
+                    path[b] = best
+                    last_b, last = b, best
+            b += direction
+
+    walk(0, 0, seed[1], 0.0, 1)  # to the right of the click...
+    if not path:
+        return np.empty((0, 2))
+    # ...then to the left, starting where the right-hand walk began, with its slope
+    first = min(path)
+    start = sorted(path)[:10]
+    slope = np.polyfit(start, [path[k] for k in start], 1)[0] if len(start) >= 2 else 0.0
+    walk(first - 1, first, path[first], slope, -1)
+
+    keys = sorted(path)
+    return np.array([[seed[0] + (k + 0.5) * step_x, path[k]] for k in keys])
+
+
+def trace_curve(img, click, cal, calib, n_points, tol=60):
+    """Trace the curve under a click. Returns (curve colour, n_points pixel positions).
+
+    1. Take the colour of the inkiest pixel near the click.
+    2. Keep pixels of about that colour, on the plot side of both axes,
+       without the axis lines, joined into one piece (small gaps like dashes bridged).
+    3. Follow that piece left and right, then pick n_points evenly spaced in x.
+    """
+    a = np.asarray(img, dtype=float)
+    h, w, _ = a.shape
+    ink = ink_map(img)
+    r = 6
+    x0, y0 = max(0, int(click[0]) - r), max(0, int(click[1]) - r)
+    patch = ink[y0: int(click[1]) + r + 1, x0: int(click[0]) + r + 1]
+    if patch.size == 0 or patch.max() < 60:
+        raise ValueError("No curve under that click. Click right on a line.")
+    iy, ix = np.unravel_index(np.argmax(patch), patch.shape)
+    py, px = y0 + iy, x0 + ix
+    colour = a[py, px]
+
+    mask = np.sqrt(((a - colour) ** 2).sum(axis=2)) < tol
+    mask = remove_long_lines(mask)
+    # only keep the plot side of each axis (drops tick labels, axis titles...)
+    rr, cc = np.mgrid[0:h, 0:w] + 0.5
+    lin_x = cal.A[0, 0] * cc + cal.A[0, 1] * rr + cal.off[0]
+    lin_y = cal.A[1, 0] * cc + cal.A[1, 1] * rr + cal.off[1]
+    axis_x = cal.to_linear([calib["Y1"]])[0, 0]  # the y-axis is at this x
+    axis_y = cal.to_linear([calib["X1"]])[0, 1]  # the x-axis is at this y
+    seed = cal.to_linear([(px + 0.5, py + 0.5)])[0]
+    mask &= np.sign(lin_x - axis_x) == np.sign(seed[0] - axis_x)
+    mask &= np.sign(lin_y - axis_y) == np.sign(seed[1] - axis_y)
+
+    joined = ndimage.binary_dilation(mask, iterations=4)  # bridge dashes and markers
+    labels, _ = ndimage.label(joined)
+    if labels[py, px] == 0:
+        raise ValueError("Couldn't pick out that curve. Try clicking another part of it.")
+    piece = (labels == labels[py, px]) & mask
+    lin = np.column_stack([lin_x[piece], lin_y[piece]])
+
+    path = follow_curve(lin, seed, np.hypot(*cal.A[0]), np.hypot(*cal.A[1]))
+    if len(path) < 2:
+        raise ValueError("That curve is too short to trace.")
+    xs = np.linspace(path[0, 0], path[-1, 0], n_points)
+    ys = np.interp(xs, path[:, 0], path[:, 1])
+    return tuple(int(c) for c in colour), cal.from_linear(np.column_stack([xs, ys]))
+
+
+def axis_title(label, unit):
+    """"Time" and "h" -> "Time (h)"; no unit -> just the label."""
+    label, unit = label.strip(), unit.strip()
+    return f"{label} ({unit})" if unit else label
+
+
 # ---- Re-plotting the result ----
 
 def make_replot(export, xlabel, ylabel, xlog, ylog):
@@ -875,6 +1074,57 @@ def cb_remove_points(i, only_last):
         ss.editor_ver += 1
 
 
+def cb_auto_axes(data):
+    try:
+        found = detect_axes(cached_rotate(data, ss.rotation))
+    except ValueError as e:
+        st.toast(str(e), icon="⚠️")
+        return
+    snapshot()
+    ss.calib = found
+    ss.calib_next = None
+    st.toast("Axes found. Now type the values of the ticks marked X1, X2, Y1 and Y2.")
+
+
+def cb_move_dataset(i, step):
+    """Move dataset i up (step=-1) or down (+1) in the list and in the CSV."""
+    j = i + step
+    if 0 <= j < len(ss.datasets):
+        snapshot()
+        ss.datasets[i], ss.datasets[j] = ss.datasets[j], ss.datasets[i]
+        ss.active = j
+
+
+def cb_sort_dataset(i):
+    """Put dataset i's points in order of increasing x."""
+    cal, _ = current_calibration()
+    pts = ss.datasets[i]["points"]
+    if cal is None or len(pts) < 2:
+        return
+    snapshot()
+    order = np.argsort(cal.to_data(pts)[:, 0], kind="stable")
+    ss.datasets[i]["points"] = [pts[k] for k in order]
+    ss.editor_ver += 1
+
+
+def cb_reverse_dataset(i):
+    snapshot()
+    ss.datasets[i]["points"].reverse()
+    ss.editor_ver += 1
+
+
+def cb_merge_dataset(i, other_uid):
+    """Add the points of another dataset onto the end of dataset i, then remove it."""
+    for j, ds in enumerate(ss.datasets):
+        if ds["uid"] == other_uid and j != i:
+            snapshot()
+            ss.datasets[i]["points"] += ds["points"]
+            ss.datasets.pop(j)
+            ss.active = i if i < j else i - 1
+            ss.editor_ver += 1
+            return
+
+
 def cb_reset_calibration():
     snapshot()
     clear_calibration()
@@ -1116,8 +1366,12 @@ def sidebar_settings(img, info, tilt):
 
     st.sidebar.write("")
     label("Axis labels", where=st.sidebar)
-    st.sidebar.text_input("x-axis label", key="xlabel", help="Used as the column header in the CSV")
-    st.sidebar.text_input("y-axis label", key="ylabel")
+    c1, c2 = st.sidebar.columns([2, 1])
+    c1.text_input("x-axis label", key="xlabel", help="Used as the column header in the CSV")
+    c2.text_input("Unit", key="xunit", placeholder="e.g. h", help='Shown as "Time (h)"')
+    c1, c2 = st.sidebar.columns([2, 1])
+    c1.text_input("y-axis label", key="ylabel")
+    c2.text_input("Unit", key="yunit", placeholder="e.g. Bq")
 
     st.sidebar.write("")
     label("View", where=st.sidebar)
@@ -1183,14 +1437,24 @@ def instruction(calibrated, cal_err):
             name = ss.datasets[ss.active]["name"]
             banner(step, f"Click data points to add them to **{name}**. "
                          "Use **+ New dataset** for another curve.")
+    elif ss.mode == MODE_TRACE:
+        step = "Step 3 · Auto-trace"
+        if not calibrated:
+            banner(step, f"Calibrate the axes first. {cal_err}", "warn")
+        else:
+            banner(step, "Click right on a curve to trace it. Each curve you click "
+                         "goes into its own dataset.")
     else:
         banner("Edit", "Click a point on the image to delete it.")
 
 
-def calibration_panel(calibrated, cal_err):
+def calibration_panel(calibrated, cal_err, data):
     label("Axis calibration")
     st.caption("Place two points on each axis at values you know (labelled ticks are best). "
                "Rotated or skewed scans are handled automatically.")
+    st.button("Auto-detect axes", on_click=cb_auto_axes, args=(data,), width="stretch",
+              help="Finds the axis lines and puts X1, X2, Y1, Y2 on the first and last "
+                   "tick marks. You still type in the values.")
     for axis, keys in [("x", ["X1", "X2"]), ("y", ["Y1", "Y2"])]:
         with st.container(border=True, key=f"card_{axis}"):
             st.toggle(f"Logarithmic {axis}-axis", key=f"{axis}log")
@@ -1222,6 +1486,11 @@ def calibration_panel(calibrated, cal_err):
     st.button("Reset calibration", on_click=cb_reset_calibration, width="stretch")
 
 
+def titles():
+    """Column headers for x and y, with units if given: "Time (h)"."""
+    return axis_title(ss.xlabel or "x", ss.xunit), axis_title(ss.ylabel or "y", ss.yunit)
+
+
 def show_parsed(text):
     """Under a value box: what the typed text was read as (only if it isn't obvious)."""
     try:
@@ -1250,6 +1519,40 @@ def dataset_cards():
                       on_click=cb_set, kwargs={"active": i})
 
 
+def trace_settings():
+    with st.container(border=True, key="card_trace"):
+        label("Auto-trace settings")
+        st.slider("Points per curve", 5, 100, key="trace_n",
+                  help="How many evenly spaced points to take along each traced curve")
+        st.slider("Colour tolerance", 20, 150, key="trace_tol",
+                  help="How different a pixel's colour can be from the curve's and still count. "
+                       "Raise it for faded or blurry scans, lower it if it picks up other lines.")
+
+
+def advanced_tools(ds, cal):
+    """Reorder, sort, reverse and merge (hidden behind a switch to keep things simple)."""
+    i = ss.active
+    with st.container(border=True, key="card_tools"):
+        c1, c2 = st.columns(2)
+        c1.button("↑ Move up", on_click=cb_move_dataset, args=(i, -1), width="stretch",
+                  disabled=i == 0, help="Earlier in the list and in the CSV")
+        c2.button("↓ Move down", on_click=cb_move_dataset, args=(i, 1), width="stretch",
+                  disabled=i == len(ss.datasets) - 1)
+        c1, c2 = st.columns(2)
+        c1.button("Sort by x", on_click=cb_sort_dataset, args=(i,), width="stretch",
+                  disabled=cal is None or len(ds["points"]) < 2,
+                  help="Put this dataset's points in order of increasing x")
+        c2.button("Reverse", on_click=cb_reverse_dataset, args=(i,), width="stretch",
+                  disabled=len(ds["points"]) < 2, help="Flip the order of this dataset's points")
+        others = [d for d in ss.datasets if d["uid"] != ds["uid"]]
+        if others:
+            names = {d["uid"]: d["name"] for d in others}
+            uid = st.selectbox("Merge another dataset into this one", list(names),
+                               format_func=lambda u: names[u], key=f"merge_{ds['uid']}")
+            st.button(f"Merge into {ds['name']}", on_click=cb_merge_dataset,
+                      args=(i, uid), width="stretch")
+
+
 def datasets_panel(cal):
     label("Datasets", f"{len(ss.datasets)} total")
     ss.active = min(ss.active, len(ss.datasets) - 1)
@@ -1274,6 +1577,10 @@ def datasets_panel(cal):
     with st.popover("Delete dataset", width="stretch"):
         st.write(f"Delete **{ds['name']}** and its {len(ds['points'])} points?")
         st.button("Yes, delete", type="primary", on_click=cb_delete_dataset, args=(ss.active,))
+    st.toggle("Advanced dataset tools", key="adv_tools",
+              help="Reorder, sort, reverse or merge datasets")
+    if ss.adv_tools:
+        advanced_tools(ds, cal)
 
     st.write("")
     label("Points", "edit to move marks")
@@ -1287,8 +1594,8 @@ def datasets_panel(cal):
     edited = st.data_editor(
         df, key=f"ed_{ds['uid']}_{ss.editor_ver}", num_rows="dynamic", width="stretch",
         height=min(38 + 35 * (len(df) + 1), 360),
-        column_config={"x": st.column_config.NumberColumn(ss.xlabel or "x", format="%.6g"),
-                       "y": st.column_config.NumberColumn(ss.ylabel or "y", format="%.6g")})
+        column_config={"x": st.column_config.NumberColumn(titles()[0], format="%.6g"),
+                       "y": st.column_config.NumberColumn(titles()[1], format="%.6g")})
     apply_table_edits(ds, df, edited, pix, cal)
 
 
@@ -1344,7 +1651,8 @@ def results_section(cal, file_stem):
             data = data[np.argsort(data[:, 0], kind="stable")]
         export.append({"name": ds["name"], "color": ds["color"],
                        "data": [list(r) for r in data]})
-    rows = csv_rows(export, ss.xlabel, ss.ylabel)
+    xtitle, ytitle = titles()
+    rows = csv_rows(export, xtitle, ytitle)
     filled = [e for e in export if e["data"]]
     total = sum([len(e["data"]) for e in filled])
     label("Results", f"{len(filled)} datasets · {total} points")
@@ -1365,12 +1673,12 @@ def results_section(cal, file_stem):
     with table:
         # preview table, same layout as the CSV with "name · label" headers
         label("CSV preview")
-        header = [f"{e['name']} · {lab}" for e in filled for lab in (ss.xlabel, ss.ylabel)]
+        header = [f"{e['name']} · {lab}" for e in filled for lab in (xtitle, ytitle)]
         st.dataframe(pd.DataFrame(rows[2:], columns=unique_names(header)), width="stretch",
                      hide_index=True, height=min(38 + 35 * (len(rows) - 2), 420))
     with plot:
         label("Check plot", "compare with the original")
-        st.image(make_replot(filled, ss.xlabel, ss.ylabel, ss.xlog, ss.ylog))
+        st.image(make_replot(filled, xtitle, ytitle, ss.xlog, ss.ylog))
 
 
 def welcome():
@@ -1391,6 +1699,26 @@ def welcome():
         st.caption("Or upload your own image in the sidebar.")
 
 
+def trace_click(img, cal, px, py):
+    """Trace the clicked curve into the active dataset (or a new one if it has points)."""
+    if cal is None:
+        st.toast("Calibrate the axes first.", icon="⚠️")
+        return
+    try:
+        colour, pts = trace_curve(img, (px, py), cal, ss.calib, ss.trace_n, ss.trace_tol)
+    except ValueError as e:
+        st.toast(str(e), icon="⚠️")
+        return
+    snapshot()
+    if ss.datasets[ss.active]["points"]:
+        ss.datasets.append(new_dataset())
+        ss.active = len(ss.datasets) - 1
+    ds = ss.datasets[ss.active]
+    ds["points"] = [[float(x), float(y)] for x, y in pts]
+    ss.editor_ver += 1
+    st.toast(f"Traced {len(pts)} points into {ds['name']}.")
+
+
 def image_panel(img, img_hash, data, cal):
     view = compute_view(img.width, img.height, ss.zoom, ss.pan_x, ss.pan_y)
     highlight = ss.calib_next if ss.mode == MODE_CAL else None
@@ -1404,6 +1732,9 @@ def image_panel(img, img_hash, data, cal):
         ss.last_click = value
         x0, y0, cw, ch = view
         px, py = x0 + value["x"] * cw, y0 + value["y"] * ch
+        if ss.mode == MODE_TRACE:
+            trace_click(img, cal, px, py)
+            st.rerun()
         if ss.mode == MODE_ADD and ss.snap:
             px, py = snap_to_marker(cached_ink(data, ss.rotation), px, py,
                                     radius=max(5.0, 0.012 * img.width))
@@ -1460,8 +1791,10 @@ def main():
         image_panel(img, img_hash, data, cal)
     with right:
         if ss.mode == MODE_CAL:
-            calibration_panel(calibrated, cal_err)
+            calibration_panel(calibrated, cal_err, data)
         else:
+            if ss.mode == MODE_TRACE:
+                trace_settings()
             datasets_panel(cal)
 
     results_section(cal, stem)
