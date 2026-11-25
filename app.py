@@ -1265,13 +1265,13 @@ def datasets_panel(cal):
     ds["name"] = name or f"Dataset {ss.active + 1}"
     ds["color"] = c2.color_picker("Colour", value=ds["color"], key=f"color_{ds['uid']}")
 
-    b1, b2, b3 = st.columns(3)
+    b1, b2 = st.columns(2)
     no_points = not ds["points"]
     b1.button("↶ Last", on_click=cb_remove_points, args=(ss.active, True), width="stretch",
               disabled=no_points, help="Remove the last point of this dataset")
     b2.button("Clear", on_click=cb_remove_points, args=(ss.active, False), width="stretch",
               disabled=no_points, help="Remove all points of this dataset")
-    with b3.popover("Delete", width="stretch"):
+    with st.popover("Delete dataset", width="stretch"):
         st.write(f"Delete **{ds['name']}** and its {len(ds['points'])} points?")
         st.button("Yes, delete", type="primary", on_click=cb_delete_dataset, args=(ss.active,))
 
