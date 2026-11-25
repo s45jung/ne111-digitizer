@@ -459,15 +459,73 @@ def rotate_image(img, angle):
                       fillcolor=background_color(img))
 
 
-def rotate_points(pts, angle, old_size, new_size):
-    """Where points land when an old_size image is rotated by angle into new_size."""
+def shift(dx, dy):
+    """3x3 matrix that moves points by (dx, dy)."""
+    return np.array([[1, 0, dx], [0, 1, dy], [0, 0, 1]], dtype=float)
+
+
+def map_points(M, pts):
+    """Apply a 3x3 matrix to (x, y) pixel points, using homogeneous coordinates."""
     pts = np.asarray(pts, dtype=float).reshape(-1, 2)
-    t = math.radians(angle)
-    d = pts - np.array(old_size) / 2  # relative to the old centre
-    # counter-clockwise on screen, remembering image rows grow downward
-    x = d[:, 0] * math.cos(t) + d[:, 1] * math.sin(t)
-    y = -d[:, 0] * math.sin(t) + d[:, 1] * math.cos(t)
-    return np.column_stack([x, y]) + np.array(new_size) / 2
+    p = np.column_stack([pts, np.ones(len(pts))]) @ M.T
+    return p[:, :2] / p[:, 2:]
+
+
+def order_corners(pts):
+    """Sort four clicks into top-left, top-right, bottom-right, bottom-left."""
+    pts = np.asarray(pts, dtype=float)
+    d = pts - pts.mean(axis=0)
+    pts = pts[np.argsort(np.arctan2(d[:, 1], d[:, 0]))]  # clockwise on screen
+    pts = np.roll(pts, -int(np.argmin(pts.sum(axis=1))), axis=0)  # start top-left
+    # a proper box turns the same way at every corner and has no tiny sides
+    edges = np.roll(pts, -1, axis=0) - pts
+    nxt = np.roll(edges, -1, axis=0)
+    turns = edges[:, 0] * nxt[:, 1] - edges[:, 1] * nxt[:, 0]
+    if np.any(turns <= 0) or np.linalg.norm(edges, axis=1).min() < 10:
+        raise ValueError("Those four clicks don't make a box. Try again.")
+    return pts
+
+
+def perspective_fit(corners, max_side=2400):
+    """Matrix and canvas size that turn a box seen at an angle into a square-on rectangle.
+
+    corners: top-left, top-right, bottom-right, bottom-left, in upload pixels.
+    Each corner gives two equations, so the 8 unknowns of the matrix come from
+    one 8x8 linear system. A margin is kept round the box so labels stay visible.
+    """
+    c = np.asarray(corners, dtype=float)
+    top, right, bottom, left = np.linalg.norm(np.roll(c, -1, axis=0) - c, axis=1)
+    w, h = (top + bottom) / 2, (left + right) / 2
+    m = 0.25 * max(w, h)
+    k = min(1.0, max_side / (max(w, h) + 2 * m))  # keep huge photos manageable
+    w, h, m = w * k, h * k, m * k
+    target = [(m, m), (m + w, m), (m + w, m + h), (m, m + h)]
+    rows, rhs = [], []
+    for (x, y), (u, v) in zip(c, target):
+        rows += [[x, y, 1, 0, 0, 0, -u * x, -u * y], [0, 0, 0, x, y, 1, -v * x, -v * y]]
+        rhs += [u, v]
+    M = np.append(np.linalg.solve(rows, rhs), 1).reshape(3, 3)
+    return M, (round(w + 2 * m), round(h + 2 * m))
+
+
+def warp_image(img, warp):
+    """The working image, plus the 3x3 matrix taking upload pixels into it.
+
+    warp is ("rotate", degrees) to straighten, or ("corners", box corners) to
+    fix perspective. Points are moved between warps with these matrices.
+    """
+    kind, arg = warp
+    if kind == "rotate":
+        out = rotate_image(img, arg)
+        c, s = math.cos(math.radians(arg)), math.sin(math.radians(arg))
+        turn = np.array([[c, s, 0], [-s, c, 0], [0, 0, 1]])  # image rows grow downward
+        return out, shift(out.width / 2, out.height / 2) @ turn @ shift(-img.width / 2, -img.height / 2)
+    M, size = perspective_fit(arg)
+    back = np.linalg.inv(M)  # PIL wants output -> input
+    back /= back[2, 2]
+    out = img.transform(size, Image.PERSPECTIVE, tuple(back.flatten()[:8]), Image.BICUBIC,
+                        fillcolor=background_color(img))
+    return out, M
 
 
 # ---- Snapping clicks onto markers ----
@@ -1126,7 +1184,7 @@ def compute_view(W, H, zoom, pan_x, pan_y):
 
 
 def render_view(img, view, disp_w, calib, datasets, active, highlight=None, connect=False,
-                grid=None):
+                grid=None, corners=None):
     """Crop img to view, scale it to disp_w wide and draw the markers on top."""
     x0, y0, cw, ch = view
     s = disp_w / cw
@@ -1147,6 +1205,13 @@ def render_view(img, view, disp_w, calib, datasets, active, highlight=None, conn
         pos = (sx + 4, sy - 6) if axis == "x" else (sx + 6, sy - 4)
         d.text(pos, text, fill="#0077cc", font=GRID_FONT, anchor="lb",
                stroke_width=3, stroke_fill="white")
+
+    # box corners clicked so far for the perspective fix
+    box = [to_screen(p) for p in corners or []]
+    if len(box) > 1:
+        d.line(box, fill="#ff9500", width=2)
+    for cx, cy in box:
+        d.rectangle([cx - 6, cy - 6, cx + 6, cy + 6], outline="#ff9500", width=3)
 
     # calibration axes, then the four markers
     for k1, k2 in [("X1", "X2"), ("Y1", "Y2")]:
@@ -1227,7 +1292,9 @@ def reset_work():
     ss.editor_ver = 0
     for k, v in GRAPH_DEFAULTS.items():
         ss[k] = v
-    ss.rotation = 0.0  # degrees the working image is rotated from the upload
+    ss.warp = ("rotate", 0.0)  # how the working image is made from the upload
+    ss.corners = None  # box corners (upload pixels) once perspective is fixed
+    ss.corner_clicks = None  # list of clicks while picking the box corners
 
 
 def init_state():
@@ -1278,25 +1345,35 @@ def current_calibration():
         return None, str(e)
 
 
-def change_rotation(data, new_angle):
-    """Straightening was switched on or off: move every placed point to match."""
-    original = cached_decode(data)[0]
-    old_size = cached_rotate(data, ss.rotation).size
-    new_size = cached_rotate(data, new_angle).size
-
-    def move(p):
-        p = rotate_points([p], -ss.rotation, old_size, original.size)  # undo the old rotation
-        p = rotate_points(p, new_angle, original.size, new_size)        # apply the new one
-        return [float(v) for v in p[0]]
-
-    for k in CAL_KEYS:
-        if ss.calib[k] is not None:
-            ss.calib[k] = tuple(move(ss.calib[k]))
+def change_warp(data, new):
+    """The working image was straightened or un-warped: move every placed point with it."""
+    M = cached_warp(data, new)[1] @ np.linalg.inv(cached_warp(data, ss.warp)[1])
+    for k, p in ss.calib.items():
+        if p is not None:
+            ss.calib[k] = tuple(map_points(M, p)[0].tolist())
     for ds in ss.datasets:
-        ds["points"] = [move(p) for p in ds["points"]]
-    ss.rotation = new_angle
+        ds["points"] = map_points(M, ds["points"]).tolist()
+    if ss.corner_clicks:
+        ss.corner_clicks = map_points(M, ss.corner_clicks).tolist()
+    ss.warp = new
     ss.history = []  # old snapshots are in the old orientation
     ss.editor_ver += 1
+
+
+def corner_click(data, px, py):
+    """Collect the four box corners; once all are in, fix the perspective."""
+    ss.corner_clicks.append((px, py))
+    if len(ss.corner_clicks) < 4:
+        return
+    try:
+        box = order_corners(ss.corner_clicks)
+    except ValueError as e:
+        st.toast(str(e), icon="⚠️")
+        ss.corner_clicks = []
+        return
+    back = np.linalg.inv(cached_warp(data, ss.warp)[1])  # clicks -> upload pixels
+    ss.corners = tuple((round(x, 2), round(y, 2)) for x, y in map_points(back, box).tolist())
+    ss.corner_clicks = None
 
 
 # ---- Callbacks ----
@@ -1346,7 +1423,7 @@ def cb_remove_points(i, only_last):
 
 def cb_auto_axes(data):
     try:
-        found = detect_axes(cached_rotate(data, ss.rotation))
+        found = detect_axes(cached_warp(data, ss.warp)[0])
     except ValueError as e:
         st.toast(str(e), icon="⚠️")
         return
@@ -1480,8 +1557,8 @@ def cached_tilt(data):
 
 
 @st.cache_resource(show_spinner=False, max_entries=8)
-def cached_rotate(data, angle):
-    return rotate_image(cached_decode(data)[0], angle)
+def cached_warp(data, warp):
+    return warp_image(cached_decode(data)[0], warp)
 
 
 @st.cache_data(show_spinner=False, max_entries=20)
@@ -1491,13 +1568,13 @@ def cached_replot(export, xlabel, ylabel, xscale, yscale):
 
 
 @st.cache_resource(show_spinner=False, max_entries=4)
-def cached_ticks(data, angle):
-    return tick_points(cached_rotate(data, angle))
+def cached_ticks(data, warp):
+    return tick_points(cached_warp(data, warp)[0])
 
 
 @st.cache_resource(show_spinner=False, max_entries=4)
-def cached_ink(data, angle):
-    return ink_map(cached_rotate(data, angle))
+def cached_ink(data, warp):
+    return ink_map(cached_warp(data, warp)[0])
 
 
 # ---- Sidebar ----
@@ -1551,12 +1628,22 @@ def sidebar_settings(img, info, tilt):
     frames = f" · frame 1 of {info['frames']}" if info["frames"] > 1 else ""
     w, h = info["size"]
     st.sidebar.caption(f"{info['format']} · {w}×{h} px · {kind}{frames}")
-    if abs(tilt) >= 0.2:
-        st.sidebar.toggle(f"Auto-straighten · {abs(tilt):.1f}° tilt found", key="straighten",
-                          help="Rotates the image so the axes are level. Points you've "
-                               "already placed move with it.")
+    if ss.corners:
+        st.sidebar.button("Undo perspective fix", on_click=cb_set, kwargs={"corners": None},
+                          width="stretch")
     else:
-        st.sidebar.caption("Image is already straight.")
+        if abs(tilt) >= 0.2:
+            st.sidebar.toggle(f"Auto-straighten · {abs(tilt):.1f}° tilt found", key="straighten",
+                              help="Rotates the image so the axes are level. Points you've "
+                                   "already placed move with it.")
+        else:
+            st.sidebar.caption("Image is already straight.")
+        picking = ss.corner_clicks is not None
+        st.sidebar.button("Cancel" if picking else "Fix perspective", width="stretch",
+                          on_click=cb_set, kwargs={"corner_clicks": None if picking else []},
+                          help="For photos taken at an angle. Click the four corners of a "
+                               "rectangle on the graph and the image is stretched so it's "
+                               "square-on. Straightens it too.")
 
     st.sidebar.header("Axis labels")
     c1, c2 = st.sidebar.columns([2, 1])
@@ -1606,7 +1693,11 @@ def step_tracker(calibrated, n_pts):
 
 def instruction(calibrated, cal_err):
     """What to do next, shown at the top of the right-hand panel."""
-    if ss.mode != MODE_CAL and not calibrated:
+    if ss.corner_clicks is not None:
+        st.info(f"Click corner **{len(ss.corner_clicks) + 1} of 4** of something rectangular "
+                "on the graph's page or screen: the plot box, the page or the screen edges. "
+                "Any order.")
+    elif ss.mode != MODE_CAL and not calibrated:
         st.warning(f"Calibrate the axes first. {cal_err}")
     elif ss.mode == MODE_CAL:
         if ss.calib_next:
@@ -1996,7 +2087,7 @@ def trace_click(img, data, cal, px, py):
         st.toast("Calibrate the axes first.", icon="⚠️")
         return
     try:
-        ink = cached_ink(data, ss.rotation)
+        ink = cached_ink(data, ss.warp)
         colour, pts = trace_curve(img, ink, (px, py), cal, ss.calib, ss.trace_n, ss.trace_tol)
     except ValueError as e:
         st.toast(str(e), icon="⚠️")
@@ -2016,7 +2107,7 @@ def image_panel(img, img_hash, data, cal):
     grid = calibration_grid(cal, img.size, ss.calib) if cal is not None and ss.show_grid else None
     # drawn sharp at RENDER_W, then the browser scales it to fit the column
     disp = render_view(img, view, RENDER_W, ss.calib, ss.datasets, ss.active, highlight,
-                       ss.connect, grid)
+                       ss.connect, grid, ss.corner_clicks)
     value = streamlit_image_coordinates(disp, key=f"img_{img_hash}", width="stretch",
                                         png_compression_level=1, cursor="crosshair")
     # the component keeps returning its last click, so only act on new ones
@@ -2026,14 +2117,17 @@ def image_panel(img, img_hash, data, cal):
         # the click is in displayed pixels; scale it back to the original image
         px = x0 + value["x"] * cw / value["width"]
         py = y0 + value["y"] * ch / value["height"]
+        if ss.corner_clicks is not None:
+            corner_click(data, px, py)
+            st.rerun()
         if ss.mode == MODE_TRACE:
             trace_click(img, data, cal, px, py)
             st.rerun()
         if ss.snap and ss.mode == MODE_CAL:
-            px, py = nearest_tick(cached_ticks(data, ss.rotation), px, py,
+            px, py = nearest_tick(cached_ticks(data, ss.warp), px, py,
                                   radius=max(8.0, 0.015 * img.width))
         elif ss.snap and ss.mode == MODE_ADD:
-            px, py = snap_to_marker(cached_ink(data, ss.rotation), px, py,
+            px, py = snap_to_marker(cached_ink(data, ss.warp), px, py,
                                     radius=max(5.0, 0.012 * img.width))
         # delete tolerance is about 1.5% of the visible width
         handle_click(px, py, 0.015 * cw)
@@ -2063,11 +2157,14 @@ def main():
     except Exception as e:  # corrupt or unsupported file
         st.error(f"Could not read this image: {e}")
         return
-    # work on a straightened copy if the scan is crooked (and the user wants that)
-    angle = -tilt if ss.straighten and abs(tilt) >= 0.2 else 0.0
-    if angle != ss.rotation:
-        change_rotation(data, angle)
-    img = cached_rotate(data, angle)
+    # work on a perspective-fixed or straightened copy if the user wants that
+    if ss.corners:
+        warp = ("corners", ss.corners)
+    else:
+        warp = ("rotate", -tilt if ss.straighten and abs(tilt) >= 0.2 else 0.0)
+    if warp != ss.warp:
+        change_warp(data, warp)
+    img = cached_warp(data, warp)[0]
     sidebar_settings(img, info, tilt)
 
     cal, cal_err = current_calibration()
