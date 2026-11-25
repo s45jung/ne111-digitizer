@@ -34,6 +34,7 @@ matplotlib.use("Agg")  # matplotlib only draws to images here, never to a window
 PALETTE = ["#e6194b", "#3cb44b", "#4363d8", "#f58231", "#911eb4", "#00a5c8",
            "#f032e6", "#9a6324", "#469990", "#800000", "#808000", "#000075"]
 CAL_KEYS = ["X1", "X2", "Y1", "Y2"]
+NO_AXES = "Couldn't find clear axes (common with photos). Place X1, X2, Y1 and Y2 by hand."
 CAL_COLORS = {"X1": "#d62728", "X2": "#d62728", "Y1": "#1f77b4", "Y2": "#1f77b4"}
 CAL_HELP = {
     "X1": "a point on the **x-axis** whose value you know (e.g. the first labelled tick)",
@@ -399,7 +400,25 @@ def background_color(img):
     return tuple(int(c) for c in np.median(border, axis=0))
 
 
-def detect_tilt(img, max_angle=10.0):
+def line_mask(img):
+    """Thin dark strokes (axes, ticks, text) as a True/False array.
+
+    A pixel counts if it's much darker than its neighbourhood, so it still works
+    on photos with uneven lighting. Big dark areas (a screen bezel, a shadow, a
+    filled marker) are dropped, as is a thin strip around the image edge.
+    """
+    gray = np.asarray(img.convert("L"), dtype=float)
+    size = max(15, min(gray.shape) // 20)
+    dark = gray < 0.65 * ndimage.uniform_filter(gray, size)
+    thick = max(7, min(gray.shape) // 150)
+    dark &= ~ndimage.binary_opening(dark, np.ones((thick, thick)))
+    edge = max(3, min(gray.shape) // 50)
+    dark[:edge] = dark[-edge:] = False
+    dark[:, :edge] = dark[:, -edge:] = False
+    return dark
+
+
+def detect_tilt(img, max_angle=45.0):
     """Estimate how far the plot is rotated, in degrees (counter-clockwise positive).
 
     Axes and gridlines are long straight lines of dark pixels. If we count the
@@ -408,7 +427,7 @@ def detect_tilt(img, max_angle=10.0):
     """
     small = img.convert("L")
     small.thumbnail((600, 600))
-    rows, cols = np.nonzero(np.asarray(small) < 128)
+    rows, cols = np.nonzero(line_mask(small))
     if len(rows) < 50:
         return 0.0
     if len(rows) > 40000:  # plenty for a good estimate, and much faster
@@ -425,7 +444,7 @@ def detect_tilt(img, max_angle=10.0):
         return score
 
     best = 0.0
-    for step, span in [(0.5, max_angle), (0.05, 0.5)]:  # coarse search, then fine
+    for step, span in [(1.0, max_angle), (0.1, 1.0), (0.02, 0.1)]:  # coarse, then finer
         angles = np.arange(best - span, best + span + step / 2, step)
         scores = [spikiness(a) for a in angles]
         best = float(angles[int(np.argmax(scores))])
@@ -625,15 +644,19 @@ def find_ticks(img):
     long vertical line. Returns (x-axis row, y-axis column, x tick columns,
     y tick rows, right end of the x-axis, top end of the y-axis).
     """
-    dark = np.asarray(img.convert("L")) < 160
+    dark = line_mask(img)
     rows, cols = dark.sum(axis=1), dark.sum(axis=0)
     if rows.max() < 0.3 * dark.shape[1] or cols.max() < 0.3 * dark.shape[0]:
-        raise ValueError("Couldn't find the axis lines. Place the points by hand.")
+        raise ValueError(NO_AXES)
     long_rows = np.nonzero(rows >= 0.6 * rows.max())[0]
     long_cols = np.nonzero(cols >= 0.6 * cols.max())[0]
     xr, yc = int(long_rows.max()), int(long_cols.min())
-    x_end = int(np.nonzero(dark[xr])[0].max()) + 1
-    y_top = int(np.nonzero(dark[:, yc])[0].min())
+    on_x, on_y = np.nonzero(dark[xr])[0], np.nonzero(dark[:, yc])[0]
+    x_end, y_top = int(on_x.max()) + 1, int(on_y.min())
+    # real axes meet in a corner; two unrelated lines usually don't
+    h, w = dark.shape
+    if on_x.min() > yc + 0.05 * w or on_y.max() < xr - 0.05 * h:
+        raise ValueError(NO_AXES)
 
     # ticks may point out of the plot or into it: try a strip on each side
     x_ticks, y_ticks = [], []
@@ -1588,6 +1611,10 @@ def instruction(calibrated, cal_err):
     elif ss.mode == MODE_CAL:
         if ss.calib_next:
             st.info(f"Click the image to place **{ss.calib_next}**, {CAL_HELP[ss.calib_next]}.")
+        elif calibrated and all(ss[f"{k}_val"] == GRAPH_DEFAULTS[f"{k}_val"] for k in CAL_KEYS):
+            st.warning("Points placed, but the values below are still the defaults. Type the "
+                       "numbers written at the ticks you clicked. If those really are your "
+                       "values, carry on.")
         elif calibrated:
             st.success("Calibration done. Check the values below, then start digitizing.")
         else:
@@ -1605,7 +1632,8 @@ def instruction(calibrated, cal_err):
 def calibration_panel(calibrated, cal_err, data):
     st.subheader("Axis calibration")
     st.caption("Place two points on each axis at values you know (labelled ticks are best). "
-               "Rotated or skewed scans are handled automatically.")
+               "Rotated or skewed scans are handled automatically. For photos, "
+               "shoot the screen or page straight on: tilt is fixed, perspective isn't.")
     st.button("Auto-detect axes", on_click=cb_auto_axes, args=(data,), width="stretch",
               help="Finds the axis lines and puts X1, X2, Y1, Y2 on the first and last "
                    "tick marks. You still type in the values.")
