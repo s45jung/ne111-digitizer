@@ -646,17 +646,33 @@ def detect_axes(img):
 
 # ---- Tracing a curve automatically ----
 
+def long_runs(mask, length):
+    """True where a pixel is part of a horizontal run of at least `length` on-pixels.
+
+    Uses running totals (cumsum), so it's fast even for very long runs:
+    a window of `length` pixels is all on when its total equals `length`.
+    """
+    h, w = mask.shape
+    if length < 1 or length > w:
+        return np.zeros_like(mask)
+    total = np.zeros((h, w + 1), dtype=np.int32)
+    total[:, 1:] = np.cumsum(mask, axis=1)
+    full = total[:, length:] - total[:, :-length] == length  # window starting at each column
+    # pixel j is covered if a full window starts anywhere from j-length+1 to j
+    starts = np.zeros((h, full.shape[1] + 1), dtype=np.int32)
+    starts[:, 1:] = np.cumsum(full, axis=1)
+    j = np.arange(w)
+    hi = np.minimum(j, w - length) + 1
+    lo = np.maximum(j - length + 1, 0)
+    return starts[:, hi] - starts[:, lo] > 0
+
+
 def remove_long_lines(mask, frac=0.25):
     """Blank out long horizontal/vertical runs (axes, frame) and the ticks on them."""
-    out = mask.copy()
     h, w = mask.shape
-    for axis, length in [(1, int(frac * w)), (0, int(frac * h))]:
-        # a pixel is in a long line if a window of `length` around it is all on
-        full = ndimage.convolve1d(mask.astype(int), np.ones(length), axis=axis,
-                                  mode="constant") >= length
-        line = ndimage.maximum_filter1d(full, length, axis=axis)
-        out &= ~ndimage.binary_dilation(line, iterations=6)
-    return out
+    lines = long_runs(mask, int(frac * w)) | long_runs(mask.T, int(frac * h)).T
+    # also clear 6 pixels either side, where the tick marks are
+    return mask & ~ndimage.maximum_filter(lines, size=13)
 
 
 def follow_curve(lin, seed, step_x, step_y):
@@ -672,10 +688,11 @@ def follow_curve(lin, seed, step_x, step_y):
     bins, ys = bins[order], lin[order, 1]
     edges = np.nonzero(np.diff(bins))[0] + 1
     slices = {}
-    for b, y in zip(bins[np.r_[0, edges]], np.split(ys, edges)):
+    first_of_each = bins[np.concatenate([[0], edges])]
+    for b, y in zip(first_of_each, np.split(ys, edges)):
         y = np.sort(y)
         gaps = np.nonzero(np.diff(y) > 3 * step_y)[0] + 1  # split into separate blobs
-        slices[int(b)] = [blob.mean() for blob in np.split(y, gaps)]
+        slices[int(b)] = np.array([blob.mean() for blob in np.split(y, gaps)])
 
     path = {}
 
@@ -684,7 +701,8 @@ def follow_curve(lin, seed, step_x, step_y):
             if b in slices:
                 gap = abs(b - last_b)
                 guess = last + slope * (b - last_b)
-                best = min(slices[b], key=lambda c: abs(c - guess))
+                blobs = slices[b]
+                best = blobs[np.argmin(np.abs(blobs - guess))]
                 # the allowed distance from the guess grows a little over gaps
                 if abs(best - guess) < (4 + 0.3 * gap) * step_y + abs(slope) * gap:
                     if b != last_b:
@@ -706,7 +724,7 @@ def follow_curve(lin, seed, step_x, step_y):
     return np.array([[seed[0] + (k + 0.5) * step_x, path[k]] for k in keys])
 
 
-def trace_curve(img, click, cal, calib, n_points, tol=60):
+def trace_curve(img, ink, click, cal, calib, n_points, tol=60):
     """Trace the curve under a click. Returns (curve colour, n_points pixel positions).
 
     1. Take the colour of the inkiest pixel near the click.
@@ -714,9 +732,7 @@ def trace_curve(img, click, cal, calib, n_points, tol=60):
        without the axis lines, joined into one piece (small gaps like dashes bridged).
     3. Follow that piece left and right, then pick n_points evenly spaced in x.
     """
-    a = np.asarray(img, dtype=float)
-    h, w, _ = a.shape
-    ink = ink_map(img)
+    a = np.asarray(img, dtype=np.float32)
     r = 10  # forgiving: the click only has to be near the curve
     x0, y0 = max(0, int(click[0]) - r), max(0, int(click[1]) - r)
     patch = ink[y0: int(click[1]) + r + 1, x0: int(click[0]) + r + 1]
@@ -726,24 +742,24 @@ def trace_curve(img, click, cal, calib, n_points, tol=60):
     py, px = y0 + iy, x0 + ix
     colour = a[py, px]
 
-    mask = np.sqrt(((a - colour) ** 2).sum(axis=2)) < tol
+    mask = ((a - colour) ** 2).sum(axis=2) < tol ** 2  # pixels of about that colour
     mask = remove_long_lines(mask)
+
     # only keep the plot side of each axis (drops tick labels, axis titles...)
-    rr, cc = np.mgrid[0:h, 0:w] + 0.5
-    lin_x = cal.A[0, 0] * cc + cal.A[0, 1] * rr + cal.off[0]
-    lin_y = cal.A[1, 0] * cc + cal.A[1, 1] * rr + cal.off[1]
+    rows, cols = np.nonzero(mask)
+    lin = cal.to_linear(np.column_stack([cols + 0.5, rows + 0.5]))
     axis_x = cal.to_linear([calib["Y1"]])[0, 0]  # the y-axis is at this x
     axis_y = cal.to_linear([calib["X1"]])[0, 1]  # the x-axis is at this y
     seed = cal.to_linear([(px + 0.5, py + 0.5)])[0]
-    mask &= np.sign(lin_x - axis_x) == np.sign(seed[0] - axis_x)
-    mask &= np.sign(lin_y - axis_y) == np.sign(seed[1] - axis_y)
+    keep = ((np.sign(lin[:, 0] - axis_x) == np.sign(seed[0] - axis_x))
+            & (np.sign(lin[:, 1] - axis_y) == np.sign(seed[1] - axis_y)))
+    mask[rows[~keep], cols[~keep]] = False
 
-    joined = ndimage.binary_dilation(mask, iterations=4)  # bridge dashes and markers
-    labels, _ = ndimage.label(joined)
+    # join nearby pixels (bridges dashes and markers), then keep the clicked piece
+    labels, _ = ndimage.label(ndimage.maximum_filter(mask, size=9))
     if labels[py, px] == 0:
         raise ValueError("Couldn't pick out that curve. Try clicking another part of it.")
-    piece = (labels == labels[py, px]) & mask
-    lin = np.column_stack([lin_x[piece], lin_y[piece]])
+    lin = lin[keep & (labels[rows, cols] == labels[py, px])]
 
     path = follow_curve(lin, seed, np.hypot(*cal.A[0]), np.hypot(*cal.A[1]))
     if len(path) < 2:
@@ -830,11 +846,6 @@ def rows_to_text(rows):
     out = io.StringIO()
     csv.writer(out, lineterminator="\n").writerows(rows)
     return out.getvalue()
-
-
-def build_csv(datasets, xlabel, ylabel):
-    """The CSV file as text (see csv_rows for the layout)."""
-    return rows_to_text(csv_rows(datasets, xlabel, ylabel))
 
 
 # ---- Drawing ----
@@ -1314,7 +1325,9 @@ def cached_sample():
     return make_sample_plot()
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
+# Images and arrays are never changed after they're made, so cache_resource can
+# hand out the same object every time instead of a fresh copy (cache_data copies).
+@st.cache_resource(show_spinner=False, max_entries=4)
 def cached_decode(data):
     return decode_image(data)
 
@@ -1324,12 +1337,18 @@ def cached_tilt(data):
     return detect_tilt(cached_decode(data)[0])
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
+@st.cache_resource(show_spinner=False, max_entries=8)
 def cached_rotate(data, angle):
     return rotate_image(cached_decode(data)[0], angle)
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
+@st.cache_data(show_spinner=False, max_entries=20)
+def cached_replot(export, xlabel, ylabel, xlog, ylog):
+    # matplotlib is the slowest part of a rerun, so only redraw when the data changes
+    return make_replot(export, xlabel, ylabel, xlog, ylog)
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
 def cached_ink(data, angle):
     return ink_map(cached_rotate(data, angle))
 
@@ -1350,6 +1369,14 @@ def sidebar_image():
         c2.button("Close", on_click=cb_set, kwargs={"use_sample": False}, width="stretch")
         return cached_sample(), "sample_plot"
     return None, ""
+
+
+def times_text(z):
+    return f"{z:g}×"
+
+
+def magnifier_text(m):
+    return "Off" if m == 1 else times_text(m)
 
 
 def sidebar_settings(img, info, tilt):
@@ -1376,10 +1403,10 @@ def sidebar_settings(img, info, tilt):
     st.sidebar.write("")
     label("View", where=st.sidebar)
     st.sidebar.select_slider("Magnifier", options=[1.0, 2.0, 3.0, 4.0, 6.0], key="magnify",
-                             format_func=lambda m: "Off" if m == 1 else f"{m:g}×",
+                             format_func=magnifier_text,
                              help="Loupe that follows the cursor over the plot")
     st.sidebar.select_slider("Zoom", options=[1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0], key="zoom",
-                             format_func=lambda z: f"{z:g}×",
+                             format_func=times_text,
                              help="Zoom in to place points more precisely")
     if ss.zoom > 1:
         st.sidebar.slider("Pan left / right", 0.0, 1.0, key="pan_x", step=0.01)
@@ -1548,7 +1575,7 @@ def advanced_tools(ds, cal):
         if others:
             names = {d["uid"]: d["name"] for d in others}
             uid = st.selectbox("Merge another dataset into this one", list(names),
-                               format_func=lambda u: names[u], key=f"merge_{ds['uid']}")
+                               format_func=names.get, key=f"merge_{ds['uid']}")
             st.button(f"Merge into {ds['name']}", on_click=cb_merge_dataset,
                       args=(i, uid), width="stretch")
 
@@ -1678,7 +1705,7 @@ def results_section(cal, file_stem):
                      hide_index=True, height=min(38 + 35 * (len(rows) - 2), 420))
     with plot:
         label("Check plot", "compare with the original")
-        st.image(make_replot(filled, xtitle, ytitle, ss.xlog, ss.ylog))
+        st.image(cached_replot(filled, xtitle, ytitle, ss.xlog, ss.ylog))
 
 
 def welcome():
@@ -1699,13 +1726,14 @@ def welcome():
         st.caption("Or upload your own image in the sidebar.")
 
 
-def trace_click(img, cal, px, py):
+def trace_click(img, data, cal, px, py):
     """Trace the clicked curve into the active dataset (or a new one if it has points)."""
     if cal is None:
         st.toast("Calibrate the axes first.", icon="⚠️")
         return
     try:
-        colour, pts = trace_curve(img, (px, py), cal, ss.calib, ss.trace_n, ss.trace_tol)
+        ink = cached_ink(data, ss.rotation)
+        colour, pts = trace_curve(img, ink, (px, py), cal, ss.calib, ss.trace_n, ss.trace_tol)
     except ValueError as e:
         st.toast(str(e), icon="⚠️")
         return
@@ -1733,7 +1761,7 @@ def image_panel(img, img_hash, data, cal):
         x0, y0, cw, ch = view
         px, py = x0 + value["x"] * cw, y0 + value["y"] * ch
         if ss.mode == MODE_TRACE:
-            trace_click(img, cal, px, py)
+            trace_click(img, data, cal, px, py)
             st.rerun()
         if ss.mode == MODE_ADD and ss.snap:
             px, py = snap_to_marker(cached_ink(data, ss.rotation), px, py,
