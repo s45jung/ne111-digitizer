@@ -168,7 +168,8 @@ WIDGET_DEFAULTS = {"xlabel": "x", "ylabel": "y", "xlog": False, "ylog": False,
                    "zoom": 1.0, "pan_x": 0.5, "pan_y": 0.5, "sort_x": False,
                    "connect": False, "magnify": 3.0, "straighten": True,
                    "snap": True, "show_grid": True, "xunit": "", "yunit": "",
-                   "trace_n": 25, "trace_tol": 60, "adv_tools": False}
+                   "trace_n": 25, "trace_tol": 60, "adv_tools": False,
+                   "round_prec": True, "x_step": "", "y_step": ""}
 PERSIST_KEYS = list(WIDGET_DEFAULTS)
 RENDER_W = 1200  # width the plot is drawn at before the browser scales it down
 MAX_HISTORY = 100
@@ -491,8 +492,11 @@ def ink_map(img):
 def snap_to_marker(ink, px, py, radius, threshold=180):
     """Move a click to the centre of the marker or line it's on, if there is one.
 
-    threshold skips faint things like light gridlines; strong ink (markers,
-    data lines) pulls the click to its centre of mass.
+    threshold skips faint things like light gridlines. A filled marker is
+    thicker than any line touching it, so its centre is the pixel deepest
+    inside the ink (found with a distance transform); this isn't pulled
+    sideways by a line or axis running out of it. Thin lines and hollow
+    markers have no thick part, so for those we use the centre of mass.
     """
     h, w = ink.shape
     x0, x1 = max(0, int(px - radius)), min(w, int(px + radius) + 1)
@@ -501,6 +505,14 @@ def snap_to_marker(ink, px, py, radius, threshold=180):
         return px, py
     yy, xx = np.mgrid[y0:y1, x0:x1] + 0.5  # pixel centres
     inside = (xx - px) ** 2 + (yy - py) ** 2 <= radius ** 2
+    strong = ink[y0:y1, x0:x1] > threshold
+
+    depth = ndimage.distance_transform_edt(np.pad(strong, 1))[1:-1, 1:-1]
+    depth[~inside] = 0
+    if depth.max() >= 2.5:  # a filled marker
+        core = depth >= depth.max() - 0.5
+        return float(xx[core].mean()), float(yy[core].mean())
+
     weight = np.where(inside, np.clip(ink[y0:y1, x0:x1] - threshold, 0, None), 0)
     if weight.sum() == 0:
         return px, py
@@ -606,12 +618,12 @@ def regular_ticks(cands, tol=2.5):
     return best
 
 
-def detect_axes(img):
-    """Suggest pixel positions for X1, X2, Y1, Y2 on a (straightened) plot.
+def find_ticks(img):
+    """Find the axes and their tick marks on a (straightened) plot.
 
     The x-axis is the lowest long horizontal line and the y-axis the left-most
-    long vertical line. X1/X2 go on the first and last tick mark along the
-    x-axis, Y1/Y2 on the lowest and highest along the y-axis.
+    long vertical line. Returns (x-axis row, y-axis column, x tick columns,
+    y tick rows, right end of the x-axis, top end of the y-axis).
     """
     dark = np.asarray(img.convert("L")) < 160
     rows, cols = dark.sum(axis=1), dark.sum(axis=0)
@@ -636,12 +648,81 @@ def detect_axes(img):
     # where the axes cross is often a tick too (e.g. the origin)
     x_ticks = regular_ticks(x_ticks + [yc + 0.5])
     y_ticks = regular_ticks(y_ticks + [xr + 0.5])
+    return xr, yc, x_ticks, y_ticks, x_end, y_top
+
+
+def detect_axes(img):
+    """Suggest X1, X2 on the first and last x-axis ticks, Y1, Y2 on the lowest and highest y ticks."""
+    xr, yc, x_ticks, y_ticks, x_end, y_top = find_ticks(img)
     if len(x_ticks) < 2:  # no ticks: use the ends of the axis line instead
         x_ticks = [yc + 0.5, x_end - 0.5]
     if len(y_ticks) < 2:
         y_ticks = [y_top + 0.5, xr + 0.5]
     return {"X1": (x_ticks[0], xr + 0.5), "X2": (x_ticks[-1], xr + 0.5),
             "Y1": (yc + 0.5, y_ticks[-1]), "Y2": (yc + 0.5, y_ticks[0])}
+
+
+def tick_points(img):
+    """Pixel positions of every tick mark on both axes (empty if none are found)."""
+    try:
+        xr, yc, x_ticks, y_ticks, _, _ = find_ticks(img)
+    except ValueError:
+        return []
+    return [(t, xr + 0.5) for t in x_ticks] + [(yc + 0.5, t) for t in y_ticks]
+
+
+def nearest_tick(ticks, px, py, radius):
+    """The tick mark closest to (px, py) if it's within radius, else the click itself."""
+    best, best_d = (px, py), radius
+    for tx, ty in ticks:
+        d = math.hypot(tx - px, ty - py)
+        if d <= best_d:
+            best, best_d = (tx, ty), d
+    return best
+
+
+# ---- Cleaning up the numbers ----
+
+def round_to_step(v, step):
+    """Round v to the largest power of ten that's no bigger than step.
+
+    step is how much one pixel is worth, so e.g. 0.0124132 with a step of
+    0.015 becomes 0.01: the digits after that are just mouse wobble.
+    """
+    if not step > 0 or not math.isfinite(step):
+        return v
+    p = 10 ** math.floor(math.log10(step))
+    return float(f"{round(v / p) * p:.12g}")  # .12g drops float noise like 40.300000000000004
+
+
+def clean_values(data, cal, round_prec, x_step, y_step):
+    """Tidy digitized values: snap to multiples of x_step / y_step (if given),
+    otherwise round to the precision one pixel of the image allows."""
+    data = np.array(data, dtype=float).reshape(-1, 2)
+    per_pixel = [np.hypot(*cal.A[0]), np.hypot(*cal.A[1])]  # fitted units per pixel
+    steps = [x_step, y_step]
+    for col in range(2):
+        for i, v in enumerate(data[:, col]):
+            if steps[col]:
+                data[i, col] = float(f"{round(v / steps[col]) * steps[col]:.12g}")
+            elif round_prec:
+                if cal.logs[col]:  # one pixel is a fixed fraction of the value
+                    step = abs(v) * (10 ** per_pixel[col] - 1)
+                else:
+                    step = per_pixel[col]
+                data[i, col] = round_to_step(v, step)
+    return data
+
+
+def precision_text(cal):
+    """Human-readable size of one pixel on each axis, e.g. "x ±0.015 · y ±2.0%"."""
+    parts = []
+    for name, res, log in zip("xy", [np.hypot(*cal.A[0]), np.hypot(*cal.A[1])], cal.logs):
+        if log:
+            parts.append(f"{name} ±{100 * (10 ** res - 1):.1f}%")
+        else:
+            parts.append(f"{name} ±{res:.2g}")
+    return " · ".join(parts)
 
 
 # ---- Tracing a curve automatically ----
@@ -1279,6 +1360,9 @@ button[data-testid="stBaseButton-primary"]:hover { background:#d9d9d9 !important
 .st-key-mode_radio label p { font-size:.82rem; }
 [data-testid="stCaptionContainer"] { color:var(--muted); }
 hr { border-color:var(--line) !important; }
+/* switched-on toggles in green */
+label:has(input[role="switch"]:checked) > div:first-of-type { background:rgb(0, 194, 141) !important; }
+label:has(input[role="switch"]:checked) > div:first-of-type > div { background:#fff !important; }
 /* the tick in a checked checkbox: black on the white box */
 [data-testid="stCheckbox"] svg polyline { stroke:#000 !important; }
 </style>
@@ -1346,6 +1430,11 @@ def cached_rotate(data, angle):
 def cached_replot(export, xlabel, ylabel, xlog, ylog):
     # matplotlib is the slowest part of a rerun, so only redraw when the data changes
     return make_replot(export, xlabel, ylabel, xlog, ylog)
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def cached_ticks(data, angle):
+    return tick_points(cached_rotate(data, angle))
 
 
 @st.cache_resource(show_spinner=False, max_entries=4)
@@ -1419,9 +1508,9 @@ def sidebar_settings(img, info, tilt):
         ImageDraw.Draw(thumb).rectangle(
             [x0 * k, y0 * k, (x0 + cw) * k, (y0 + ch) * k], outline="#ff2b2b", width=3)
         st.sidebar.image(thumb, caption="Visible region")
-    st.sidebar.checkbox("Snap clicks to markers", key="snap",
-                        help="When adding points, each click moves to the centre of "
-                             "the marker or line under it")
+    st.sidebar.checkbox("Snap clicks to markers and ticks", key="snap",
+                        help="Calibration clicks jump onto the nearest tick mark, and data "
+                             "clicks move to the centre of the marker or line under them")
     st.sidebar.checkbox("Calibration check grid", key="show_grid",
                         help="Blue gridlines worked out from your calibration. If they sit "
                              "on the plot's own gridlines, the calibration is right.")
@@ -1511,6 +1600,23 @@ def calibration_panel(calibrated, cal_err, data):
     elif cal_err and not ss.calib_next:
         st.error(cal_err)
     st.button("Reset calibration", on_click=cb_reset_calibration, width="stretch")
+
+
+def clean_options():
+    """(round to precision?, x step or None, y step or None) from the clean-up boxes."""
+    steps = []
+    for k in ["x_step", "y_step"]:
+        try:
+            step = parse_number(ss[k]) if ss[k].strip() else None
+        except ValueError:
+            step = None
+        steps.append(step if step and step > 0 else None)
+    return ss.round_prec, steps[0], steps[1]
+
+
+def cleaned(cal, pts):
+    """Data values of pixel points, tidied with the clean-up options."""
+    return clean_values(cal.to_data(pts), cal, *clean_options())
 
 
 def titles():
@@ -1615,7 +1721,7 @@ def datasets_panel(cal):
         st.caption("Calibrate the axes to see values.")
         return
     pix = np.asarray(ds["points"], dtype=float).reshape(-1, 2)
-    vals = cal.to_data(pix)
+    vals = cleaned(cal, pix)
     df = pd.DataFrame({"x": [float(fmt(v)) for v in vals[:, 0]],
                        "y": [float(fmt(v)) for v in vals[:, 1]]})
     edited = st.data_editor(
@@ -1664,6 +1770,25 @@ def unique_names(names):
     return result
 
 
+def clean_up_card(cal):
+    """Options that stop mouse wobble showing up as extra digits (0.0124 instead of 0)."""
+    with st.container(border=True, key="card_clean"):
+        c1, c2, c3 = st.columns([2, 1, 1], vertical_alignment="bottom")
+        c1.checkbox("Round to image precision", key="round_prec",
+                    help="Drops digits finer than one pixel of the image, "
+                         f"which are just mouse wobble. One pixel here is {precision_text(cal)}.")
+        c1.caption(f"One pixel = {precision_text(cal)}")
+        for col, k, name in [(c2, "x_step", "x"), (c3, "y_step", "y")]:
+            col.text_input(f"Snap {name} to multiples of", key=k, placeholder="off",
+                           help=f"For data taken at round {name} values (e.g. 1 or 0.5). "
+                                "Leave blank to turn off.")
+            if ss[k].strip():
+                try:
+                    parse_number(ss[k])
+                except ValueError as e:
+                    col.caption(f"⚠ {e}")
+
+
 def results_section(cal, file_stem):
     st.divider()
     if cal is None:
@@ -1673,7 +1798,7 @@ def results_section(cal, file_stem):
 
     export = []
     for ds in ss.datasets:
-        data = cal.to_data(ds["points"])
+        data = cleaned(cal, ds["points"])
         if ss.sort_x:
             data = data[np.argsort(data[:, 0], kind="stable")]
         export.append({"name": ds["name"], "color": ds["color"],
@@ -1683,6 +1808,7 @@ def results_section(cal, file_stem):
     filled = [e for e in export if e["data"]]
     total = sum([len(e["data"]) for e in filled])
     label("Results", f"{len(filled)} datasets · {total} points")
+    clean_up_card(cal)
 
     c1, c2, c3 = st.columns([2, 2, 3], vertical_alignment="center")
     c1.download_button("Download CSV", rows_to_text(rows).encode("utf-8-sig"),
@@ -1763,6 +1889,9 @@ def image_panel(img, img_hash, data, cal):
         if ss.mode == MODE_TRACE:
             trace_click(img, data, cal, px, py)
             st.rerun()
+        if ss.mode == MODE_CAL and ss.snap:
+            px, py = nearest_tick(cached_ticks(data, ss.rotation), px, py,
+                                  radius=max(8.0, 0.015 * img.width))
         if ss.mode == MODE_ADD and ss.snap:
             px, py = snap_to_marker(cached_ink(data, ss.rotation), px, py,
                                     radius=max(5.0, 0.012 * img.width))
