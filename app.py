@@ -13,18 +13,16 @@ How to use it:
 
 import copy
 import csv
-import hashlib
 import io
 import math
-import uuid
 from pathlib import Path
 
 import numpy as np
-from streamlit_image_coordinates import streamlit_image_coordinates
-from scipy import ndimage
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageOps
+from scipy import ndimage
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 
 # ---- Constants ----
@@ -43,21 +41,16 @@ MODE_CAL, MODE_ADD, MODE_TRACE, MODE_DEL = "Calibrate", "Add points", "Auto-trac
 MODES = [MODE_CAL, MODE_ADD, MODE_TRACE, MODE_DEL]
 IMAGE_TYPES = ["png", "jpg", "jpeg", "gif", "tif", "tiff", "bmp", "webp"]
 
-# Starting values for the widgets. Streamlit forgets a widget's value when the
-# widget isn't drawn, so these keys get re-saved at the top of every run.
-WIDGET_DEFAULTS = {"xlabel": "x", "ylabel": "y", "xlog": False, "ylog": False,
-                   "X1_val": "0", "X2_val": "10", "Y1_val": "0", "Y2_val": "10",
-                   "zoom": 1.0, "pan_x": 0.5, "pan_y": 0.5, "sort_x": False,
-                   "connect": False, "straighten": True,
-                   "snap": True, "show_grid": True, "xunit": "", "yunit": "",
-                   "trace_n": 25, "trace_tol": 60, "adv_tools": False,
-                   "round_prec": True, "x_step": "", "y_step": ""}
-PERSIST_KEYS = list(WIDGET_DEFAULTS)
-# Settings that describe one particular graph's axes: these go back to their
-# defaults when a new image is loaded. (Preferences like snapping are kept.)
-GRAPH_KEYS = ["xlabel", "ylabel", "xunit", "yunit", "xlog", "ylog",
-              "X1_val", "X2_val", "Y1_val", "Y2_val", "x_step", "y_step",
-              "zoom", "pan_x", "pan_y", "sort_x"]
+# Starting values for the widgets. Settings about one graph's axes go back to
+# these when a new image is loaded; preferences are kept.
+GRAPH_DEFAULTS = {"xlabel": "x", "ylabel": "y", "xunit": "", "yunit": "",
+                  "xlog": False, "ylog": False,
+                  "X1_val": "0", "X2_val": "10", "Y1_val": "0", "Y2_val": "10",
+                  "x_step": "", "y_step": "", "zoom": 1.0, "pan_x": 0.5, "pan_y": 0.5,
+                  "sort_x": False}
+PREFERENCES = {"straighten": True, "snap": True, "show_grid": True, "connect": False,
+               "round_prec": True, "trace_n": 25, "trace_tol": 60, "adv_tools": False}
+WIDGET_DEFAULTS = {**GRAPH_DEFAULTS, **PREFERENCES}
 RENDER_W = 1200  # width the plot is drawn at before the browser scales it down
 MAX_HISTORY = 100
 
@@ -846,13 +839,6 @@ def compute_view(W, H, zoom, pan_x, pan_y):
     return x0, y0, cw, ch
 
 
-def draw_cross(d, cx, cy, r, col):
-    """Calibration marker: a circle with a cross through it."""
-    d.line([(cx - r, cy), (cx + r, cy)], fill=col, width=2)
-    d.line([(cx, cy - r), (cx, cy + r)], fill=col, width=2)
-    d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=2)
-
-
 def render_view(img, view, disp_w, calib, datasets, active, highlight=None, connect=False,
                 grid=None):
     """Crop img to view, scale it to disp_w wide and draw the markers on top."""
@@ -871,11 +857,9 @@ def render_view(img, view, disp_w, calib, datasets, active, highlight=None, conn
     for start, end, text, spot, axis in grid or []:
         d.line([to_screen(start), to_screen(end)], fill="#00a2ff80", width=1)
         sx, sy = to_screen(spot)
-        if axis == "x":  # label just above the x-axis
-            pos, anchor = (sx + 4, sy - 6), "lb"
-        else:            # label just right of the y-axis
-            pos, anchor = (sx + 6, sy - 4), "lb"
-        d.text(pos, text, fill="#0077cc", font=GRID_FONT, anchor=anchor,
+        # labels just above the x-axis / just right of the y-axis
+        pos = (sx + 4, sy - 6) if axis == "x" else (sx + 6, sy - 4)
+        d.text(pos, text, fill="#0077cc", font=GRID_FONT, anchor="lb",
                stroke_width=3, stroke_fill="white")
 
     # calibration axes, then the four markers
@@ -888,7 +872,10 @@ def render_view(img, view, disp_w, calib, datasets, active, highlight=None, conn
         cx, cy = to_screen(calib[k])
         col = CAL_COLORS[k]
         r = 14 if k == highlight else 10
-        draw_cross(d, cx, cy, r, col)
+        # a circle with a cross through it
+        d.line([(cx - r, cy), (cx + r, cy)], fill=col, width=2)
+        d.line([(cx, cy - r), (cx, cy + r)], fill=col, width=2)
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=2)
         d.text((cx + r + 3, cy - r - 12), k, fill=col, font=LABEL_FONT,
                stroke_width=3, stroke_fill="white")
 
@@ -934,7 +921,8 @@ def new_dataset():
         if c not in used:
             color = c
             break
-    return {"uid": uuid.uuid4().hex[:8], "name": f"Dataset {n}", "color": color, "points": []}
+    ss.uid_counter = ss.get("uid_counter", 0) + 1  # never reset, so ids are never reused
+    return {"uid": f"d{ss.uid_counter}", "name": f"Dataset {n}", "color": color, "points": []}
 
 
 def clear_calibration():
@@ -953,8 +941,8 @@ def reset_work():
     ss.history = []
     ss.last_click = None
     ss.editor_ver = 0
-    for k in GRAPH_KEYS:
-        ss[k] = WIDGET_DEFAULTS[k]
+    for k, v in GRAPH_DEFAULTS.items():
+        ss[k] = v
     ss.rotation = 0.0  # degrees the working image is rotated from the upload
 
 
@@ -964,11 +952,7 @@ def init_state():
             ss[k] = ss[k]  # keeps the value alive while its widget is hidden
         else:
             ss[k] = v
-    for k in CAL_KEYS:
-        if not isinstance(ss[f"{k}_val"], str):
-            ss[f"{k}_val"] = fmt(ss[f"{k}_val"])
     ss.setdefault("img_hash", None)
-    ss.setdefault("rotation", 0.0)
     ss.setdefault("use_sample", False)
     if "datasets" not in ss:
         reset_work()
@@ -1666,7 +1650,7 @@ def main():
         return
     st.title("Plot Digitizer")
 
-    img_hash = hashlib.md5(data).hexdigest()[:12]
+    img_hash = hash(data)  # same bytes -> same number, so we can tell when the image changes
     if ss.img_hash != img_hash:  # new image, so start fresh
         ss.img_hash = img_hash
         reset_work()
