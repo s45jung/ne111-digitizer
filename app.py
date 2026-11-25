@@ -42,11 +42,11 @@ html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
 #img { width: 100%; height: auto; display: block; cursor: crosshair; user-select: none;
        -webkit-user-drag: none; border-radius: 6px; }
 #loupe { position: absolute; pointer-events: none; width: 160px; height: 160px; border-radius: 50%;
-         border: 2px solid #fff; box-shadow: 0 0 0 1px #000, 0 8px 24px rgba(0,0,0,.55);
+         box-shadow: 0 0 0 2px #fff, 0 0 0 3px #000, 0 8px 24px rgba(0,0,0,.55);
          background-repeat: no-repeat; background-color: #fff; display: none; }
 #loupe:before, #loupe:after { content: ""; position: absolute; background: rgba(255,40,40,.85); }
-#loupe:before { left: 50%; top: 22%; bottom: 22%; width: 1px; }
-#loupe:after { top: 50%; left: 22%; right: 22%; height: 1px; }
+#loupe:before { left: calc(50% - 0.5px); top: 22%; bottom: 22%; width: 1px; }
+#loupe:after { top: calc(50% - 0.5px); left: 22%; right: 22%; height: 1px; }
 </style>
 </head>
 <body>
@@ -98,10 +98,18 @@ img.addEventListener("mousemove", function (ev) {
     return;
   }
   const r = img.getBoundingClientRect();
-  const x = ev.clientX - r.left, y = ev.clientY - r.top, R = 80;
+  const x = ev.clientX - r.left, y = ev.clientY - r.top;
+  const R = 80, gap = 24;
+  // put the loupe above-right of the cursor so it never hides the target,
+  // flipping sides near an edge so it never gets cut off
+  let left = x + gap, top = y - gap - 2 * R;
+  if (left + 2 * R > r.width) left = x - gap - 2 * R;
+  if (top < 0) top = y + gap;
+  left = Math.max(0, Math.min(left, r.width - 2 * R));
+  top = Math.max(0, Math.min(top, r.height - 2 * R));
   loupe.style.display = "block";
-  loupe.style.left = (x - R) + "px";
-  loupe.style.top = (y - R) + "px";
+  loupe.style.left = left + "px";
+  loupe.style.top = top + "px";
   loupe.style.backgroundSize = (r.width * mag) + "px " + (r.height * mag) + "px";
   loupe.style.backgroundPosition = (R - x * mag) + "px " + (R - y * mag) + "px";
 });
