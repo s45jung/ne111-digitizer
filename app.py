@@ -928,7 +928,7 @@ CSS = """
 .stApp p, .stApp label, .stApp button, .stApp input, .stApp textarea, .stApp li,
 .stApp h1, .stApp h2, .stApp h3, .stApp td, .stApp th, .dg-root { font-family:'Montserrat', sans-serif; }
 header[data-testid="stHeader"] { background:#000; }
-.block-container { padding-top:2.4rem; padding-bottom:3rem; max-width:1500px; }
+.block-container { padding:2.4rem 2rem 3rem; max-width:1500px; }
 section[data-testid="stSidebar"] { border-right:1px solid var(--line); }
 
 /* headings */
@@ -1194,7 +1194,7 @@ def calibration_panel(calibrated, cal_err):
             st.toggle(f"Logarithmic {axis}-axis", key=f"{axis}log")
             for k in keys:
                 c1, c2 = st.columns([1.1, 1])
-                text = f"✓ Move {k}" if ss.calib[k] is not None else f"Place {k}"
+                text = f"{k} ✓" if ss.calib[k] is not None else f"Set {k}"
                 c1.button(text, key=f"pick_{k}",
                           type="primary" if ss.calib_next == k else "secondary",
                           on_click=cb_set, kwargs={"calib_next": k}, width="stretch",
@@ -1454,7 +1454,7 @@ def main():
              on_change=cb_copy, args=("mode_radio", "mode"))
     instruction(calibrated, cal_err)
 
-    left, right = st.columns([3, 2], gap="large")
+    left, right = st.columns([5, 3], gap="medium")
     with left:
         image_panel(img, img_hash, data, cal)
     with right:
