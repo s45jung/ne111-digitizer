@@ -40,11 +40,14 @@ CAL_HELP = {
 MODE_CAL, MODE_ADD, MODE_TRACE, MODE_DEL = "Calibrate", "Add points", "Auto-trace", "Delete points"
 MODES = [MODE_CAL, MODE_ADD, MODE_TRACE, MODE_DEL]
 IMAGE_TYPES = ["png", "jpg", "jpeg", "gif", "tif", "tiff", "bmp", "webp"]
+LINEAR, LOG, RECIPROCAL, SQRT, SQUARED, DATE = (
+    "Linear", "Logarithmic", "Reciprocal (1/x)", "Square root", "Squared", "Date / time")
+AXIS_SCALES = [LINEAR, LOG, RECIPROCAL, SQRT, SQUARED, DATE]
 
 # Starting values for the widgets. Settings about one graph's axes go back to
 # these when a new image is loaded; preferences are kept.
 GRAPH_DEFAULTS = {"xlabel": "x", "ylabel": "y", "xunit": "", "yunit": "",
-                  "xlog": False, "ylog": False,
+                  "xscale": LINEAR, "yscale": LINEAR,
                   "X1_val": "0", "X2_val": "10", "Y1_val": "0", "Y2_val": "10",
                   "x_step": "", "y_step": "", "zoom": 1.0, "pan_x": 0.5, "pan_y": 0.5,
                   "sort_x": False}
@@ -139,16 +142,82 @@ def make_sample_plot():
     return out.getvalue()
 
 
-# ---- Calibration ----
+# ---- Axis scales ----
 
-def axis_value(v, log, name):
-    """The value used in the fit: v itself, or log10(v) on a log axis."""
-    if log:
-        if v is None or v <= 0:
+def to_axis(values, scale, name="Value"):
+    """Data values -> evenly spaced positions along the axis.
+
+    On a log axis equal steps in log10(x) are equal distances, on a reciprocal
+    axis it's 1/x, and so on. Dates are stored as seconds, which are already even.
+    """
+    v = np.asarray(values, dtype=float)
+    if scale == LOG:
+        if np.any(v <= 0):
             raise ValueError(f"{name} must be greater than 0 on a logarithmic axis.")
-        return math.log10(v)
-    return float(v)
+        return np.log10(v)
+    if scale == RECIPROCAL:
+        if np.any(v == 0):
+            raise ValueError(f"{name} can't be 0 on a reciprocal axis.")
+        return 1 / v
+    if scale == SQRT:
+        if np.any(v < 0):
+            raise ValueError(f"{name} can't be negative on a square-root axis.")
+        return np.sqrt(v)
+    if scale == SQUARED:
+        if np.any(v < 0):
+            raise ValueError(f"{name} can't be negative on a squared axis.")
+        return v ** 2
+    return v  # linear, and dates (in seconds)
 
+
+def from_axis(positions, scale):
+    """Positions along the axis -> data values (the reverse of to_axis).
+
+    Positions where the scale has no value (e.g. below 0 on a square-root
+    axis) come back as nan.
+    """
+    u = np.asarray(positions, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if scale == LOG:
+            return 10.0 ** u
+        if scale == RECIPROCAL:
+            return 1 / u
+        if scale == SQRT:
+            return np.where(u >= 0, u ** 2, np.nan)
+        if scale == SQUARED:
+            return np.sqrt(u)
+    return u
+
+
+def parse_date(text):
+    """A typed date/time -> seconds. Accepts 2024-03-01, 2024-03-01 14:30, 01/03/2024..."""
+    text = str(text).strip()
+    if not any(c in text for c in "-/:"):
+        raise ValueError(f"'{text}' isn't a date. Type it like 2024-03-01 or 2024-03-01 14:30.")
+    try:
+        return pd.Timestamp(text).timestamp()
+    except ValueError:
+        raise ValueError(f"'{text}' isn't a date I can read. Type it like 2024-03-01 14:30.")
+
+
+def parse_value(text, scale):
+    """A typed axis value: a date on a date axis, otherwise a number."""
+    return parse_date(text) if scale == DATE else parse_number(text)
+
+
+def fmt_value(v, scale=LINEAR):
+    """A value as text: dates as 2024-03-01 (plus the time if it isn't midnight)."""
+    if scale != DATE:
+        return fmt(v)
+    if not math.isfinite(v):
+        return ""
+    t = pd.Timestamp(v, unit="s")
+    if t.hour == t.minute == t.second == 0:
+        return t.strftime("%Y-%m-%d")
+    return t.strftime("%Y-%m-%d %H:%M" if t.second == 0 else "%Y-%m-%d %H:%M:%S")
+
+
+# ---- Calibration ----
 
 def fit_axis(p1, p2, along_other, v1, v2):
     """Solve for (a, b, c) so that value = a*col + b*row + c.
@@ -165,20 +234,20 @@ def fit_axis(p1, p2, along_other, v1, v2):
 class Calibration:
     """Converts between image pixels and data values.
 
-    The fit is [X', Y'] = A @ [col, row] + off, where X' is x (or log10 x) and
-    Y' is y (or log10 y). It's a general affine map, so rotation, skew and
-    different scales on each axis are all handled, and the four points don't
-    need to share an origin.
+    The fit is [X', Y'] = A @ [col, row] + off, where X' and Y' are positions
+    along each axis (see to_axis: e.g. log10 x on a log axis). It's a general
+    affine map, so rotation, skew and different scales on each axis are all
+    handled, and the four points don't need to share an origin.
     """
 
-    def __init__(self, px, vals, xlog, ylog):
-        """px: pixel position of each of X1, X2, Y1, Y2. vals: the typed-in values."""
+    def __init__(self, px, vals, xscale=LINEAR, yscale=LINEAR):
+        """px: pixel position of X1, X2, Y1, Y2. vals: their values (dates in seconds)."""
         missing = [k for k in CAL_KEYS if px.get(k) is None]
         if missing:
             raise ValueError("Place calibration point(s): " + ", ".join(missing) + ".")
         X1, X2, Y1, Y2 = [np.asarray(px[k], dtype=float) for k in CAL_KEYS]
-        is_log = {"X1": xlog, "X2": xlog, "Y1": ylog, "Y2": ylog}
-        v = {k: axis_value(vals[k], is_log[k], k) for k in CAL_KEYS}
+        scale_of = {"X1": xscale, "X2": xscale, "Y1": yscale, "Y2": yscale}
+        v = {k: float(to_axis(vals[k], scale_of[k], k)) for k in CAL_KEYS}
 
         if v["X1"] == v["X2"]:
             raise ValueError("X1 and X2 must have different values.")
@@ -201,34 +270,31 @@ class Calibration:
 
         self.A = A
         self.off = np.array([c, f])
-        self.logs = [xlog, ylog]
+        self.scales = [xscale, yscale]
+        self.centre = np.mean([X1, X2, Y1, Y2], axis=0)  # middle of the plot, roughly
 
     def to_linear(self, pts):
-        """Pixel positions -> values in the fitted space (log10 on log axes)."""
+        """Pixel positions -> positions along each axis (the fitted space)."""
         pts = np.asarray(pts, dtype=float).reshape(-1, 2)
         return pts @ self.A.T + self.off
 
     def from_linear(self, vals):
-        """Values in the fitted space -> pixel positions."""
+        """Positions along each axis -> pixel positions."""
         vals = np.asarray(vals, dtype=float).reshape(-1, 2)
         return (vals - self.off) @ np.linalg.inv(self.A).T
 
     def to_data(self, pts):
         """Pixel positions (N x 2) -> data values (N x 2)."""
         vals = self.to_linear(pts)
-        for col, log in enumerate(self.logs):
-            if log:
-                vals[:, col] = 10.0 ** vals[:, col]
+        for col, scale in enumerate(self.scales):
+            vals[:, col] = from_axis(vals[:, col], scale)
         return vals
 
     def to_pixel(self, vals):
         """Data values (N x 2) -> pixel positions (N x 2)."""
         v = np.asarray(vals, dtype=float).reshape(-1, 2).copy()
-        for col, (log, name) in enumerate(zip(self.logs, ["x", "y"])):
-            if log:
-                if np.any(v[:, col] <= 0):
-                    raise ValueError(f"{name} values must be greater than 0 on a log axis.")
-                v[:, col] = np.log10(v[:, col])
+        for col, (scale, name) in enumerate(zip(self.scales, ["x values", "y values"])):
+            v[:, col] = to_axis(v[:, col], scale, name)
         return self.from_linear(v)
 
 
@@ -418,13 +484,40 @@ def nice_ticks(lo, hi, n=8):
     return [round(v, 12) for v in np.arange(first, hi + step / 2, step) if v <= hi]
 
 
-def axis_ticks(lo, hi, log):
-    """Ticks in fitted space. On a log axis these are whole decades (1, 10, 100...)."""
-    if log and hi - lo >= 1:
-        return [float(k) for k in range(math.ceil(min(lo, hi)), math.floor(max(lo, hi)) + 1)]
-    if log:  # less than a decade showing: round numbers, converted to log10
-        return [math.log10(v) for v in nice_ticks(10 ** lo, 10 ** hi) if v > 0]
-    return nice_ticks(lo, hi)
+def date_ticks(lo, hi):
+    """Round times (every minute, hour, day, week...) between lo and hi seconds."""
+    steps = [60, 300, 900, 3600, 3 * 3600, 6 * 3600, 86400, 2 * 86400, 7 * 86400,
+             30 * 86400, 365 * 86400]
+    step = steps[-1]
+    for s in steps:
+        if s >= (hi - lo) / 8:
+            step = s
+            break
+    return list(np.arange(math.ceil(lo / step) * step, hi + 1, step, dtype=float))
+
+
+def axis_ticks(lo, hi, scale):
+    """Gridline positions along an axis that runs from lo to hi (in fitted space)."""
+    lo, hi = min(lo, hi), max(lo, hi)
+    if scale == LINEAR:
+        return nice_ticks(lo, hi)
+    if scale == DATE:
+        return date_ticks(lo, hi)
+    if scale == LOG and hi - lo >= 1:  # whole decades: 1, 10, 100...
+        return [float(k) for k in range(math.ceil(lo), math.floor(hi) + 1)]
+    # other scales: round data values, then placed where they belong on the axis
+    ends = from_axis([lo, hi], scale)
+    if not np.all(np.isfinite(ends)):
+        return []
+    ticks = []
+    for v in nice_ticks(min(ends), max(ends)):
+        try:
+            u = float(to_axis(v, scale))
+        except ValueError:  # e.g. 0 on a reciprocal axis
+            continue
+        if lo <= u <= hi:
+            ticks.append(u)
+    return ticks
 
 
 def calibration_grid(cal, size, calib):
@@ -441,9 +534,9 @@ def calibration_grid(cal, size, calib):
     x_axis_line = cal.to_linear([calib["Y1"]])[0, 0]
 
     lines = []
-    for axis, (lo, hi), log in [("x", (xlo, xhi), cal.logs[0]), ("y", (ylo, yhi), cal.logs[1])]:
-        for v in axis_ticks(lo, hi, log):
-            text = fmt(10 ** v if log else v)
+    for axis, (lo, hi), scale in [("x", (xlo, xhi), cal.scales[0]), ("y", (ylo, yhi), cal.scales[1])]:
+        for v in axis_ticks(lo, hi, scale):
+            text = fmt_value(float(from_axis(v, scale)), scale)
             if axis == "x":
                 ends = cal.from_linear([(v, ylo), (v, yhi)])
                 spot = cal.from_linear([(v, y_axis_line)])[0]
@@ -575,33 +668,58 @@ def round_to_step(v, step):
     return float(f"{round(v / p) * p:.12g}")  # .12g drops float noise like 40.300000000000004
 
 
+def pixel_step(cal, col, v):
+    """How much the value v changes over one pixel along its axis."""
+    res = np.hypot(*cal.A[col])  # fitted units per pixel
+    scale = cal.scales[col]
+    try:
+        u = float(to_axis(v, scale))
+    except ValueError:
+        return float("nan")
+    return abs(float(from_axis(u + res, scale)) - v)
+
+
 def clean_values(data, cal, round_prec, x_step, y_step):
     """Tidy digitized values: snap to multiples of x_step / y_step (if given),
     otherwise round to the precision one pixel of the image allows."""
     data = np.array(data, dtype=float).reshape(-1, 2)
-    per_pixel = [np.hypot(*cal.A[0]), np.hypot(*cal.A[1])]  # fitted units per pixel
     steps = [x_step, y_step]
     for col in range(2):
         for i, v in enumerate(data[:, col]):
-            if steps[col]:
+            if not math.isfinite(v):
+                continue
+            if steps[col] and cal.scales[col] != DATE:
                 data[i, col] = float(f"{round(v / steps[col]) * steps[col]:.12g}")
             elif round_prec:
-                if cal.logs[col]:  # one pixel is a fixed fraction of the value
-                    step = abs(v) * (10 ** per_pixel[col] - 1)
+                step = pixel_step(cal, col, v)
+                if cal.scales[col] == DATE:  # round to a whole second/minute/hour/day
+                    unit = 1
+                    for u in [60, 3600, 86400]:
+                        if u <= step:
+                            unit = u
+                    data[i, col] = round(v / unit) * unit
                 else:
-                    step = per_pixel[col]
-                data[i, col] = round_to_step(v, step)
+                    data[i, col] = round_to_step(v, step)
     return data
 
 
 def precision_text(cal):
-    """Human-readable size of one pixel on each axis, e.g. "x ±0.015 · y ±2.0%"."""
+    """How much one pixel is worth on each axis, e.g. "x ±0.015 · y ±2.0%"."""
+    middle = cal.to_data([cal.centre])[0]
     parts = []
-    for name, res, log in zip("xy", [np.hypot(*cal.A[0]), np.hypot(*cal.A[1])], cal.logs):
-        if log:
-            parts.append(f"{name} ±{100 * (10 ** res - 1):.1f}%")
+    for col, name in enumerate("xy"):
+        scale = cal.scales[col]
+        step = pixel_step(cal, col, middle[col])
+        if not math.isfinite(step):
+            continue
+        if scale == LOG:
+            parts.append(f"{name} ±{100 * step / middle[col]:.1f}%")
+        elif scale == DATE:
+            parts.append(f"{name} ±{step / 3600:.2g} h" if step >= 600 else f"{name} ±{step:.2g} s")
+        elif scale == LINEAR:
+            parts.append(f"{name} ±{step:.2g}")
         else:
-            parts.append(f"{name} ±{res:.2g}")
+            parts.append(f"{name} ±{step:.2g} mid-plot")
     return " · ".join(parts)
 
 
@@ -747,11 +865,15 @@ def axis_title(label, unit):
 
 # ---- Re-plotting the result ----
 
-def make_replot(export, xlabel, ylabel, xlog, ylog):
-    """Matplotlib figure of the digitized data, styled to match the app."""
+def make_replot(export, xlabel, ylabel, xscale, yscale):
+    """Matplotlib figure of the digitized data on the same kind of axes as the original."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
+    def column(values, scale):
+        values = np.asarray(values, dtype=float)
+        return pd.to_datetime(values, unit="s") if scale == DATE else values
 
     fig, ax = plt.subplots(figsize=(6.4, 4.2), dpi=150)
     fig.patch.set_facecolor("#1c1c1e")
@@ -759,13 +881,23 @@ def make_replot(export, xlabel, ylabel, xlog, ylog):
     for ds in export:
         if len(ds["data"]) == 0:
             continue
-        data = np.asarray(ds["data"])
-        ax.plot(data[:, 0], data[:, 1], "o-", color=ds["color"], label=ds["name"],
-                markersize=5, linewidth=1.2, markeredgecolor="white", markeredgewidth=0.8)
-    if xlog:
-        ax.set_xscale("log")
-    if ylog:
-        ax.set_yscale("log")
+        data = np.asarray(ds["data"], dtype=float)
+        ax.plot(column(data[:, 0], xscale), column(data[:, 1], yscale), "o-", color=ds["color"],
+                label=ds["name"], markersize=5, linewidth=1.2,
+                markeredgecolor="white", markeredgewidth=0.8)
+    for scale, set_scale in [(xscale, ax.set_xscale), (yscale, ax.set_yscale)]:
+        if scale == LOG:
+            set_scale("log")
+        elif scale in (RECIPROCAL, SQRT, SQUARED):
+            def forward(v, scale=scale):
+                with np.errstate(all="ignore"):
+                    return to_axis_unchecked(v, scale)
+
+            def inverse(u, scale=scale):
+                return from_axis(u, scale)
+            set_scale("function", functions=(forward, inverse))
+    if xscale == DATE:
+        fig.autofmt_xdate()
     ax.set_xlabel(xlabel, color="#c7c7cc")
     ax.set_ylabel(ylabel, color="#c7c7cc")
     ax.tick_params(colors="#8e8e93")
@@ -780,13 +912,26 @@ def make_replot(export, xlabel, ylabel, xlog, ylog):
     return buf.getvalue()
 
 
+def to_axis_unchecked(values, scale):
+    """Like to_axis, but returns nan for values the scale can't show instead of an error
+    (matplotlib asks about values outside the data range too)."""
+    v = np.asarray(values, dtype=float)
+    if scale == RECIPROCAL:
+        return np.where(v != 0, 1 / np.where(v != 0, v, 1), np.nan)
+    if scale == SQRT:
+        return np.where(v >= 0, np.sqrt(np.abs(v)), np.nan)
+    if scale == SQUARED:
+        return np.where(v >= 0, v ** 2, np.nan)
+    return v
+
+
 # ---- CSV export ----
 
 def fmt(v):
     return f"{v:.6g}"
 
 
-def csv_rows(datasets, xlabel, ylabel):
+def csv_rows(datasets, xlabel, ylabel, xscale=LINEAR, yscale=LINEAR):
     """Rows of the CSV as lists of strings (empty datasets are left out).
 
     Row 1: dataset names. Row 2: x/y labels. Then x, y pairs side by side,
@@ -805,7 +950,7 @@ def csv_rows(datasets, xlabel, ylabel):
         for ds in filled:
             if i < len(ds["data"]):
                 x, y = ds["data"][i]
-                row += [fmt(x), fmt(y)]
+                row += [fmt_value(x, xscale), fmt_value(y, yscale)]
             else:
                 row += ["", ""]
         rows.append(row)
@@ -974,16 +1119,21 @@ def undo():
         ss.editor_ver += 1
 
 
+def scale_of(k):
+    """The scale chosen for the axis that calibration point k ("X1", "Y2"...) is on."""
+    return ss.xscale if k[0] == "X" else ss.yscale
+
+
 def current_calibration():
     """(Calibration, None) if the axes are calibrated, else (None, error message)."""
     vals = {}
     for k in CAL_KEYS:
         try:
-            vals[k] = parse_number(ss[f"{k}_val"])
+            vals[k] = parse_value(ss[f"{k}_val"], scale_of(k))
         except ValueError as e:
             return None, f"{k} value: {e}"
     try:
-        return Calibration(ss.calib, vals, ss.xlog, ss.ylog), None
+        return Calibration(ss.calib, vals, ss.xscale, ss.yscale), None
     except ValueError as e:
         return None, str(e)
 
@@ -1183,9 +1333,9 @@ def cached_rotate(data, angle):
 
 
 @st.cache_data(show_spinner=False, max_entries=20)
-def cached_replot(export, xlabel, ylabel, xlog, ylog):
+def cached_replot(export, xlabel, ylabel, xscale, yscale):
     # matplotlib is the slowest part of a rerun, so only redraw when the data changes
-    return make_replot(export, xlabel, ylabel, xlog, ylog)
+    return make_replot(export, xlabel, ylabel, xscale, yscale)
 
 
 @st.cache_resource(show_spinner=False, max_entries=4)
@@ -1308,7 +1458,9 @@ def calibration_panel(calibrated, cal_err, data):
                    "tick marks. You still type in the values.")
     for axis, keys in [("x", ["X1", "X2"]), ("y", ["Y1", "Y2"])]:
         with st.container(border=True):
-            st.toggle(f"Logarithmic {axis}-axis", key=f"{axis}log")
+            st.selectbox(f"{axis}-axis scale", AXIS_SCALES, key=f"{axis}scale",
+                         help="How values are spaced along this axis. Most plots are linear; "
+                              "log axes go 1, 10, 100...")
             for k in keys:
                 c1, c2 = st.columns([1.1, 1])
                 text = f"{k} ✓" if ss.calib[k] is not None else f"Set {k}"
@@ -1317,10 +1469,12 @@ def calibration_panel(calibrated, cal_err, data):
                           on_click=cb_set, kwargs={"calib_next": k}, width="stretch",
                           help=f"Then click {CAL_HELP[k]}")
                 with c2:
+                    is_date = scale_of(k) == DATE
                     st.text_input(f"{k} value", key=f"{k}_val", label_visibility="collapsed",
-                                  placeholder="e.g. 10^4",
-                                  help="Any number: 250, -3.5, 1e4, 10^4, 2x10^-3, 1/3")
-                    show_parsed(ss[f"{k}_val"])
+                                  placeholder="e.g. 2024-03-01" if is_date else "e.g. 10^4",
+                                  help="A date like 2024-03-01 or 2024-03-01 14:30" if is_date
+                                  else "Any number: 250, -3.5, 1e4, 10^4, 2x10^-3, 1/3")
+                    show_parsed(ss[f"{k}_val"], scale_of(k))
 
     if calibrated:
         tx, ty = axis_tilt(ss.calib)
@@ -1346,7 +1500,7 @@ def clean_options():
         except ValueError:
             step = None
         steps.append(step if step and step > 0 else None)
-    return ss.round_prec, steps[0], steps[1]
+    return ss.round_prec, steps[0], steps[1]  # (ignored on date axes)
 
 
 def cleaned(cal, pts):
@@ -1359,19 +1513,16 @@ def titles():
     return axis_title(ss.xlabel or "x", ss.xunit), axis_title(ss.ylabel or "y", ss.yunit)
 
 
-def show_parsed(text):
+def show_parsed(text, scale):
     """Under a value box: what the typed text was read as (only if it isn't obvious)."""
     try:
-        v = parse_number(text)
+        v = parse_value(text, scale)
     except ValueError:
-        st.caption("⚠ can't read this")
+        st.caption("⚠ can't read this" if scale != DATE else "⚠ type a date, e.g. 2024-03-01")
         return
-    try:
-        plain = float(text) == v
-    except ValueError:
-        plain = False
-    if not plain:
-        st.caption(f"= {fmt(v)}")
+    shown = fmt_value(v, scale)
+    if shown != str(text).strip():
+        st.caption(f"= {shown}")
 
 
 def dataset_label(i):
@@ -1457,35 +1608,53 @@ def datasets_panel(cal):
         return
     pix = np.asarray(ds["points"], dtype=float).reshape(-1, 2)
     vals = cleaned(cal, pix)
-    df = pd.DataFrame({"x": [float(fmt(v)) for v in vals[:, 0]],
-                       "y": [float(fmt(v)) for v in vals[:, 1]]})
-    edited = st.data_editor(
-        df, key=f"ed_{ds['uid']}_{ss.editor_ver}", num_rows="dynamic", width="stretch",
-        height=min(38 + 35 * (len(df) + 1), 360),
-        column_config={"x": st.column_config.NumberColumn(titles()[0], format="%.6g"),
-                       "y": st.column_config.NumberColumn(titles()[1], format="%.6g")})
+    df = pd.DataFrame()
+    config = {}
+    for col, (name, title, scale) in enumerate(zip(["x", "y"], titles(), cal.scales)):
+        if scale == DATE:  # dates are shown and typed as text
+            df[name] = [fmt_value(v, DATE) for v in vals[:, col]]
+            config[name] = st.column_config.TextColumn(title)
+        else:
+            df[name] = [float(fmt(v)) for v in vals[:, col]]
+            config[name] = st.column_config.NumberColumn(title, format="%.6g")
+    edited = st.data_editor(df, key=f"ed_{ds['uid']}_{ss.editor_ver}", num_rows="dynamic",
+                            width="stretch", height=min(38 + 35 * (len(df) + 1), 360),
+                            column_config=config)
     apply_table_edits(ds, df, edited, pix, cal)
+
+
+def table_numbers(frame, scales):
+    """The table's x and y columns as numbers (dates back to seconds; blanks -> nan)."""
+    out = np.full((len(frame), 2), np.nan)
+    for col, (name, scale) in enumerate(zip(["x", "y"], scales)):
+        for i, v in enumerate(frame[name]):
+            if v is None or str(v).strip() in ("", "nan", "None"):
+                continue
+            out[i, col] = parse_date(v) if scale == DATE else float(v)
+    return out
 
 
 def apply_table_edits(ds, df, edited, pix, cal):
     """Move, add or remove points to match what was typed into the table."""
-    unchanged = (edited.shape == df.shape and edited.index.equals(df.index)
-                 and np.allclose(edited.to_numpy(float), df.to_numpy(float), equal_nan=True))
-    if unchanged:
+    try:
+        old, new = table_numbers(df, cal.scales), table_numbers(edited, cal.scales)
+    except ValueError as e:
+        st.error(str(e))
         return
-    if edited[["x", "y"]].isna().any().any():
+    if edited.index.equals(df.index) and np.allclose(old, new, equal_nan=True):
+        return  # nothing changed
+    if np.isnan(new).any():
         st.caption("Enter both x and y for the new row.")
         return
 
     new_pts = []
     try:
-        for idx, row in edited.iterrows():
-            xy = [row["x"], row["y"]]
-            if idx in df.index and np.allclose(xy, df.loc[idx, ["x", "y"]].to_numpy(float)):
+        for row, idx in enumerate(edited.index):
+            if idx in df.index and np.allclose(new[row], old[df.index.get_loc(idx)]):
                 # row not changed: keep the exact clicked pixel, not the rounded value
                 new_pts.append(list(pix[df.index.get_loc(idx)]))
             else:
-                new_pts.append(list(cal.to_pixel([xy])[0]))
+                new_pts.append(list(cal.to_pixel([new[row]])[0]))
     except ValueError as e:
         st.error(str(e))
         return
@@ -1517,7 +1686,9 @@ def clean_up_card(cal):
             col.text_input(f"Snap {name} to multiples of", key=k, placeholder="off",
                            help=f"For data taken at round {name} values (e.g. 1 or 0.5). "
                                 "Leave blank to turn off.")
-            if ss[k].strip():
+            if (ss.xscale if name == "x" else ss.yscale) == DATE:
+                col.caption("not used on a date axis")
+            elif ss[k].strip():
                 try:
                     parse_number(ss[k])
                 except ValueError as e:
@@ -1539,7 +1710,7 @@ def results_section(cal, file_stem):
         export.append({"name": ds["name"], "color": ds["color"],
                        "data": [list(r) for r in data]})
     xtitle, ytitle = titles()
-    rows = csv_rows(export, xtitle, ytitle)
+    rows = csv_rows(export, xtitle, ytitle, ss.xscale, ss.yscale)
     filled = [e for e in export if e["data"]]
     total = sum([len(e["data"]) for e in filled])
     st.subheader("Results")
@@ -1567,7 +1738,7 @@ def results_section(cal, file_stem):
                      hide_index=True, height=min(38 + 35 * (len(rows) - 2), 420))
     with plot:
         st.markdown("**Check plot** (compare with the original)")
-        st.image(cached_replot(filled, xtitle, ytitle, ss.xlog, ss.ylog))
+        st.image(cached_replot(filled, xtitle, ytitle, ss.xscale, ss.yscale))
 
 
 def welcome():
