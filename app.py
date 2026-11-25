@@ -672,7 +672,9 @@ section[data-testid="stSidebar"] { border-right:1px solid var(--line); }
 [class*="st-key-dscard_"] { position:relative; gap:0 !important; }
 [class*="st-key-dscard_"] [data-testid="stElementContainer"]:has(button) {
     position:absolute; inset:0; z-index:2; margin:0; }
-[class*="st-key-dscard_"] [data-testid="stElementContainer"]:has(button) * { width:100%; height:100%; }
+[class*="st-key-dscard_"] [data-testid="stElementContainer"]:has(button),
+[class*="st-key-dscard_"] [data-testid="stElementContainer"]:has(button) * {
+    width:100% !important; height:100% !important; max-width:none !important; }
 [class*="st-key-dscard_"] button { opacity:0; cursor:pointer; }
 
 /* instruction banner */
