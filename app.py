@@ -163,9 +163,10 @@ IMAGE_TYPES = ["png", "jpg", "jpeg", "gif", "tif", "tiff", "bmp", "webp"]
 # Starting values for the widgets. Streamlit forgets a widget's value when the
 # widget isn't drawn, so these keys get re-saved at the top of every run.
 WIDGET_DEFAULTS = {"xlabel": "x", "ylabel": "y", "xlog": False, "ylog": False,
-                   "X1_val": 0.0, "X2_val": 10.0, "Y1_val": 0.0, "Y2_val": 10.0,
+                   "X1_val": "0", "X2_val": "10", "Y1_val": "0", "Y2_val": "10",
                    "zoom": 1.0, "pan_x": 0.5, "pan_y": 0.5, "sort_x": False,
-                   "connect": False, "magnify": 3.0}
+                   "connect": False, "magnify": 3.0, "straighten": True,
+                   "snap": True, "show_grid": True}
 PERSIST_KEYS = list(WIDGET_DEFAULTS)
 RENDER_W = 1200  # width the plot is drawn at before the browser scales it down
 MAX_HISTORY = 100
@@ -319,10 +320,19 @@ class Calibration:
         self.off = np.array([c, f])
         self.logs = [xlog, ylog]
 
+    def to_linear(self, pts):
+        """Pixel positions -> values in the fitted space (log10 on log axes)."""
+        pts = np.asarray(pts, dtype=float).reshape(-1, 2)
+        return pts @ self.A.T + self.off
+
+    def from_linear(self, vals):
+        """Values in the fitted space -> pixel positions."""
+        vals = np.asarray(vals, dtype=float).reshape(-1, 2)
+        return (vals - self.off) @ np.linalg.inv(self.A).T
+
     def to_data(self, pts):
         """Pixel positions (N x 2) -> data values (N x 2)."""
-        pts = np.asarray(pts, dtype=float).reshape(-1, 2)
-        vals = pts @ self.A.T + self.off
+        vals = self.to_linear(pts)
         for col, log in enumerate(self.logs):
             if log:
                 vals[:, col] = 10.0 ** vals[:, col]
@@ -336,7 +346,7 @@ class Calibration:
                 if np.any(v[:, col] <= 0):
                     raise ValueError(f"{name} values must be greater than 0 on a log axis.")
                 v[:, col] = np.log10(v[:, col])
-        return (v - self.off) @ np.linalg.inv(self.A).T
+        return self.from_linear(v)
 
 
 def line_tilt(p, q, vertical):
@@ -357,6 +367,232 @@ def axis_tilt(px):
     """Tilt of the x-axis from horizontal and of the y-axis from vertical."""
     return (line_tilt(px.get("X1"), px.get("X2"), False),
             line_tilt(px.get("Y1"), px.get("Y2"), True))
+
+
+# ---- Typing in numbers ----
+
+SUPERSCRIPTS = {"⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4", "⁵": "5",
+                "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9", "⁻": "-"}
+
+
+def parse_number(text):
+    """Read a typed value such as 250, -2.5, 1e4, 10^4, 10**-3, 2x10^3, 10⁴ or 1,000.
+
+    Raises ValueError if it can't be read.
+    """
+    s = str(text).strip().lower().replace(" ", "").replace(",", "").replace("−", "-")
+    # turn superscripts into powers: 10⁻³ -> 10^-3
+    out = ""
+    in_power = False
+    for ch in s:
+        if ch in SUPERSCRIPTS:
+            if not in_power:
+                out += "^"
+                in_power = True
+            out += SUPERSCRIPTS[ch]
+        else:
+            out += ch
+            in_power = False
+    s = out.replace("**", "^").replace("×", "*").replace("x", "*")
+    if s == "":
+        raise ValueError("nothing typed in")
+
+    try:
+        total = 1.0
+        for factor in s.split("*"):  # 2*10^3 -> "2", "10^3"
+            top, _, bottom = factor.partition("/")  # allow simple fractions like 1/3
+            if "^" in top:
+                base, power = top.split("^")
+                value = float(base) ** float(power)
+            else:
+                value = float(top)
+            if bottom:
+                value = value / float(bottom)
+            total = total * value
+    except (ValueError, ZeroDivisionError, OverflowError):
+        raise ValueError(f"'{text}' isn't a number I can read. Try 250, 1e4 or 10^4.")
+    if not math.isfinite(total):
+        raise ValueError(f"'{text}' is too big.")
+    return total
+
+
+# ---- Straightening ----
+
+def background_color(img):
+    """Most images have a plain border; use its median colour as the background."""
+    a = np.asarray(img, dtype=float)
+    border = np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]])
+    return tuple(int(c) for c in np.median(border, axis=0))
+
+
+def detect_tilt(img, max_angle=10.0):
+    """Estimate how far the plot is rotated, in degrees (counter-clockwise positive).
+
+    Axes and gridlines are long straight lines of dark pixels. If we count the
+    dark pixels in each row (and column) after rotating their coordinates, the
+    counts are spikiest when we've rotated by exactly the plot's tilt.
+    """
+    small = img.convert("L")
+    small.thumbnail((600, 600))
+    rows, cols = np.nonzero(np.asarray(small) < 128)
+    if len(rows) < 50:
+        return 0.0
+    if len(rows) > 40000:  # plenty for a good estimate, and much faster
+        pick = np.random.default_rng(0).choice(len(rows), 40000, replace=False)
+        rows, cols = rows[pick], cols[pick]
+
+    def spikiness(deg):
+        t = math.radians(deg)
+        score = 0.0
+        for proj in [cols * math.sin(t) + rows * math.cos(t),   # along horizontal lines
+                     cols * math.cos(t) - rows * math.sin(t)]:  # along vertical lines
+            counts = np.bincount(np.round(proj - proj.min()).astype(int))
+            score += np.sum(counts.astype(float) ** 2)
+        return score
+
+    best = 0.0
+    for step, span in [(0.5, max_angle), (0.05, 0.5)]:  # coarse search, then fine
+        angles = np.arange(best - span, best + span + step / 2, step)
+        scores = [spikiness(a) for a in angles]
+        best = float(angles[int(np.argmax(scores))])
+    return round(best, 2)
+
+
+def rotate_image(img, angle):
+    """Rotate counter-clockwise by angle degrees, growing the canvas to fit."""
+    if angle == 0:
+        return img
+    return img.rotate(angle, resample=Image.BICUBIC, expand=True,
+                      fillcolor=background_color(img))
+
+
+def rotate_points(pts, angle, old_size, new_size):
+    """Where points land when an old_size image is rotated by angle into new_size."""
+    pts = np.asarray(pts, dtype=float).reshape(-1, 2)
+    t = math.radians(angle)
+    d = pts - np.array(old_size) / 2  # relative to the old centre
+    # counter-clockwise on screen, remembering image rows grow downward
+    x = d[:, 0] * math.cos(t) + d[:, 1] * math.sin(t)
+    y = -d[:, 0] * math.sin(t) + d[:, 1] * math.cos(t)
+    return np.column_stack([x, y]) + np.array(new_size) / 2
+
+
+# ---- Snapping clicks onto markers ----
+
+def ink_map(img):
+    """How different each pixel is from the background (0 = background)."""
+    a = np.asarray(img, dtype=np.float32)
+    bg = np.array(background_color(img), dtype=np.float32)
+    return np.sqrt(np.sum((a - bg) ** 2, axis=2))
+
+
+def snap_to_marker(ink, px, py, radius, threshold=180):
+    """Move a click to the centre of the marker or line it's on, if there is one.
+
+    threshold skips faint things like light gridlines; strong ink (markers,
+    data lines) pulls the click to its centre of mass.
+    """
+    h, w = ink.shape
+    x0, x1 = max(0, int(px - radius)), min(w, int(px + radius) + 1)
+    y0, y1 = max(0, int(py - radius)), min(h, int(py + radius) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return px, py
+    yy, xx = np.mgrid[y0:y1, x0:x1] + 0.5  # pixel centres
+    inside = (xx - px) ** 2 + (yy - py) ** 2 <= radius ** 2
+    weight = np.where(inside, np.clip(ink[y0:y1, x0:x1] - threshold, 0, None), 0)
+    if weight.sum() == 0:
+        return px, py
+    return float((weight * xx).sum() / weight.sum()), float((weight * yy).sum() / weight.sum())
+
+
+# ---- Calibration check grid ----
+
+def nice_ticks(lo, hi, n=8):
+    """About n round-number tick values between lo and hi (steps of 1, 2 or 5 x 10^k)."""
+    if hi < lo:
+        lo, hi = hi, lo
+    raw = (hi - lo) / n
+    if raw <= 0:
+        return []
+    mag = 10 ** math.floor(math.log10(raw))
+    step = mag
+    for m in [1, 2, 5, 10]:
+        if m * mag >= raw:
+            step = m * mag
+            break
+    first = math.ceil(lo / step) * step
+    return [round(v, 12) for v in np.arange(first, hi + step / 2, step) if v <= hi]
+
+
+def axis_ticks(lo, hi, log):
+    """Ticks in fitted space. On a log axis these are whole decades (1, 10, 100...)."""
+    if log and hi - lo >= 1:
+        return [float(k) for k in range(math.ceil(min(lo, hi)), math.floor(max(lo, hi)) + 1)]
+    if log:  # less than a decade showing: round numbers, converted to log10
+        return [math.log10(v) for v in nice_ticks(10 ** lo, 10 ** hi) if v > 0]
+    return nice_ticks(lo, hi)
+
+
+def calibration_grid(cal, size, calib):
+    """Gridlines from the calibration, as (start_px, end_px, label, label_px, axis).
+
+    If the calibration is right, these sit exactly on the plot's own gridlines.
+    """
+    w, h = size
+    corners = cal.to_linear([(0, 0), (w, 0), (0, h), (w, h)])
+    xlo, xhi = corners[:, 0].min(), corners[:, 0].max()
+    ylo, yhi = corners[:, 1].min(), corners[:, 1].max()
+    # labels go along the axes the user clicked
+    y_axis_line = cal.to_linear([calib["X1"]])[0, 1]
+    x_axis_line = cal.to_linear([calib["Y1"]])[0, 0]
+
+    lines = []
+    for axis, (lo, hi), log in [("x", (xlo, xhi), cal.logs[0]), ("y", (ylo, yhi), cal.logs[1])]:
+        for v in axis_ticks(lo, hi, log):
+            text = fmt(10 ** v if log else v)
+            if axis == "x":
+                ends = cal.from_linear([(v, ylo), (v, yhi)])
+                spot = cal.from_linear([(v, y_axis_line)])[0]
+            else:
+                ends = cal.from_linear([(xlo, v), (xhi, v)])
+                spot = cal.from_linear([(x_axis_line, v)])[0]
+            lines.append((tuple(ends[0]), tuple(ends[1]), text, tuple(spot), axis))
+    return lines
+
+
+# ---- Re-plotting the result ----
+
+def make_replot(export, xlabel, ylabel, xlog, ylog):
+    """Matplotlib figure of the digitized data, styled to match the app."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.2), dpi=150)
+    fig.patch.set_facecolor("#1c1c1e")
+    ax.set_facecolor("#000000")
+    for ds in export:
+        if len(ds["data"]) == 0:
+            continue
+        data = np.asarray(ds["data"])
+        ax.plot(data[:, 0], data[:, 1], "o-", color=ds["color"], label=ds["name"],
+                markersize=5, linewidth=1.2, markeredgecolor="white", markeredgewidth=0.8)
+    if xlog:
+        ax.set_xscale("log")
+    if ylog:
+        ax.set_yscale("log")
+    ax.set_xlabel(xlabel, color="#c7c7cc")
+    ax.set_ylabel(ylabel, color="#c7c7cc")
+    ax.tick_params(colors="#8e8e93")
+    for spine in ax.spines.values():
+        spine.set_color("#3a3a3c")
+    ax.grid(True, which="both", color="#2c2c2e", linewidth=0.6)
+    ax.legend(facecolor="#1c1c1e", edgecolor="#3a3a3c", labelcolor="white", fontsize=8)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return buf.getvalue()
 
 
 # ---- CSV export ----
@@ -412,6 +648,7 @@ def load_font(size):
 
 
 LABEL_FONT = load_font(18)
+GRID_FONT = load_font(15)
 
 
 def compute_view(W, H, zoom, pan_x, pan_y):
@@ -429,7 +666,8 @@ def draw_cross(d, cx, cy, r, col):
     d.ellipse([cx - r, cy - r, cx + r, cy + r], outline=col, width=2)
 
 
-def render_view(img, view, disp_w, calib, datasets, active, highlight=None, connect=False):
+def render_view(img, view, disp_w, calib, datasets, active, highlight=None, connect=False,
+                grid=None):
     """Crop img to view, scale it to disp_w wide and draw the markers on top."""
     x0, y0, cw, ch = view
     s = disp_w / cw
@@ -441,6 +679,17 @@ def render_view(img, view, disp_w, calib, datasets, active, highlight=None, conn
 
     def to_screen(p):
         return (p[0] - x0) * s, (p[1] - y0) * s
+
+    # check grid from the calibration: should sit on the plot's own gridlines
+    for start, end, text, spot, axis in grid or []:
+        d.line([to_screen(start), to_screen(end)], fill="#00a2ff80", width=1)
+        sx, sy = to_screen(spot)
+        if axis == "x":  # label just above the x-axis
+            pos, anchor = (sx + 4, sy - 6), "lb"
+        else:            # label just right of the y-axis
+            pos, anchor = (sx + 6, sy - 4), "lb"
+        d.text(pos, text, fill="#0077cc", font=GRID_FONT, anchor=anchor,
+               stroke_width=3, stroke_fill="white")
 
     # calibration axes, then the four markers
     for k1, k2 in [("X1", "X2"), ("Y1", "Y2")]:
@@ -518,6 +767,7 @@ def reset_work():
     ss.last_click = None
     ss.editor_ver = 0
     ss.zoom, ss.pan_x, ss.pan_y = 1.0, 0.5, 0.5
+    ss.rotation = 0.0  # degrees the working image is rotated from the upload
 
 
 def init_state():
@@ -526,7 +776,11 @@ def init_state():
             ss[k] = ss[k]  # keeps the value alive while its widget is hidden
         else:
             ss[k] = v
+    for k in CAL_KEYS:
+        if not isinstance(ss[f"{k}_val"], str):
+            ss[f"{k}_val"] = fmt(ss[f"{k}_val"])
     ss.setdefault("img_hash", None)
+    ss.setdefault("rotation", 0.0)
     ss.setdefault("use_sample", False)
     if "datasets" not in ss:
         reset_work()
@@ -550,11 +804,37 @@ def undo():
 
 def current_calibration():
     """(Calibration, None) if the axes are calibrated, else (None, error message)."""
-    vals = {k: ss[f"{k}_val"] for k in CAL_KEYS}
+    vals = {}
+    for k in CAL_KEYS:
+        try:
+            vals[k] = parse_number(ss[f"{k}_val"])
+        except ValueError as e:
+            return None, f"{k} value: {e}"
     try:
         return Calibration(ss.calib, vals, ss.xlog, ss.ylog), None
     except ValueError as e:
         return None, str(e)
+
+
+def change_rotation(data, new_angle):
+    """Straightening was switched on or off: move every placed point to match."""
+    original = cached_decode(data)[0]
+    old_size = cached_rotate(data, ss.rotation).size
+    new_size = cached_rotate(data, new_angle).size
+
+    def move(p):
+        p = rotate_points([p], -ss.rotation, old_size, original.size)  # undo the old rotation
+        p = rotate_points(p, new_angle, original.size, new_size)        # apply the new one
+        return [float(v) for v in p[0]]
+
+    for k in CAL_KEYS:
+        if ss.calib[k] is not None:
+            ss.calib[k] = tuple(move(ss.calib[k]))
+    for ds in ss.datasets:
+        ds["points"] = [move(p) for p in ds["points"]]
+    ss.rotation = new_angle
+    ss.history = []  # old snapshots are in the old orientation
+    ss.editor_ver += 1
 
 
 # ---- Callbacks ----
@@ -785,6 +1065,21 @@ def cached_decode(data):
     return decode_image(data)
 
 
+@st.cache_data(show_spinner=False, max_entries=4)
+def cached_tilt(data):
+    return detect_tilt(cached_decode(data)[0])
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_rotate(data, angle):
+    return rotate_image(cached_decode(data)[0], angle)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def cached_ink(data, angle):
+    return ink_map(cached_rotate(data, angle))
+
+
 def sidebar_image():
     """File uploader / sample buttons. Returns (image bytes or None, file name stem)."""
     label("Image", where=st.sidebar)
@@ -803,11 +1098,17 @@ def sidebar_image():
     return None, ""
 
 
-def sidebar_settings(img, info):
+def sidebar_settings(img, info, tilt):
     kind = "greyscale" if info["greyscale"] else "colour"
     frames = f" · frame 1 of {info['frames']}" if info["frames"] > 1 else ""
     w, h = info["size"]
     st.sidebar.caption(f"{info['format']} · {w}×{h} px · {kind}{frames}")
+    if abs(tilt) >= 0.2:
+        st.sidebar.toggle(f"Auto-straighten · {abs(tilt):.1f}° tilt found", key="straighten",
+                          help="Rotates the image so the axes are level. Points you've "
+                               "already placed move with it.")
+    else:
+        st.sidebar.caption("Image is already straight.")
 
     st.sidebar.write("")
     label("Axis labels", where=st.sidebar)
@@ -833,6 +1134,12 @@ def sidebar_settings(img, info):
         ImageDraw.Draw(thumb).rectangle(
             [x0 * k, y0 * k, (x0 + cw) * k, (y0 + ch) * k], outline="#ff2b2b", width=3)
         st.sidebar.image(thumb, caption="Visible region")
+    st.sidebar.checkbox("Snap clicks to markers", key="snap",
+                        help="When adding points, each click moves to the centre of "
+                             "the marker or line under it")
+    st.sidebar.checkbox("Calibration check grid", key="show_grid",
+                        help="Blue gridlines worked out from your calibration. If they sit "
+                             "on the plot's own gridlines, the calibration is right.")
     st.sidebar.checkbox("Connect points with lines", key="connect")
 
 
@@ -890,8 +1197,11 @@ def calibration_panel(calibrated, cal_err):
                           type="primary" if ss.calib_next == k else "secondary",
                           on_click=cb_set, kwargs={"calib_next": k}, width="stretch",
                           help=f"Then click {CAL_HELP[k]}")
-                c2.number_input(f"{k} value", key=f"{k}_val", format="%g",
-                                label_visibility="collapsed")
+                with c2:
+                    st.text_input(f"{k} value", key=f"{k}_val", label_visibility="collapsed",
+                                  placeholder="e.g. 10^4",
+                                  help="Any number: 250, -3.5, 1e4, 10^4, 2x10^-3, 1/3")
+                    show_parsed(ss[f"{k}_val"])
 
     if calibrated:
         tx, ty = axis_tilt(ss.calib)
@@ -899,11 +1209,28 @@ def calibration_panel(calibrated, cal_err):
         if max(abs(tx), abs(ty)) > 0.3:
             msg += " · rotation corrected"
         st.caption(msg)
+        if ss.show_grid:
+            st.caption("Blue check grid should sit on the plot's gridlines.")
         st.button("Start digitizing →", type="primary", width="stretch",
                   on_click=cb_set, kwargs={"mode": MODE_ADD})
     elif cal_err and not ss.calib_next:
         st.error(cal_err)
     st.button("Reset calibration", on_click=cb_reset_calibration, width="stretch")
+
+
+def show_parsed(text):
+    """Under a value box: what the typed text was read as (only if it isn't obvious)."""
+    try:
+        v = parse_number(text)
+    except ValueError:
+        st.caption("⚠ can't read this")
+        return
+    try:
+        plain = float(text) == v
+    except ValueError:
+        plain = False
+    if not plain:
+        st.caption(f"= {fmt(v)}")
 
 
 def dataset_cards():
@@ -1012,7 +1339,8 @@ def results_section(cal, file_stem):
         data = cal.to_data(ds["points"])
         if ss.sort_x:
             data = data[np.argsort(data[:, 0], kind="stable")]
-        export.append({"name": ds["name"], "data": [list(r) for r in data]})
+        export.append({"name": ds["name"], "color": ds["color"],
+                       "data": [list(r) for r in data]})
     rows = csv_rows(export, ss.xlabel, ss.ylabel)
     filled = [e for e in export if e["data"]]
     total = sum([len(e["data"]) for e in filled])
@@ -1030,10 +1358,16 @@ def results_section(cal, file_stem):
         st.caption("No points yet.")
         return
 
-    # preview table, same layout as the CSV with "name · label" headers
-    header = [f"{e['name']} · {lab}" for e in filled for lab in (ss.xlabel, ss.ylabel)]
-    st.dataframe(pd.DataFrame(rows[2:], columns=unique_names(header)), width="stretch",
-                 hide_index=True, height=min(38 + 35 * (len(rows) - 2), 420))
+    table, plot = st.columns([3, 2], gap="large")
+    with table:
+        # preview table, same layout as the CSV with "name · label" headers
+        label("CSV preview")
+        header = [f"{e['name']} · {lab}" for e in filled for lab in (ss.xlabel, ss.ylabel)]
+        st.dataframe(pd.DataFrame(rows[2:], columns=unique_names(header)), width="stretch",
+                     hide_index=True, height=min(38 + 35 * (len(rows) - 2), 420))
+    with plot:
+        label("Check plot", "compare with the original")
+        st.image(make_replot(filled, ss.xlabel, ss.ylabel, ss.xlog, ss.ylog))
 
 
 def welcome():
@@ -1054,18 +1388,24 @@ def welcome():
         st.caption("Or upload your own image in the sidebar.")
 
 
-def image_panel(img, img_hash):
+def image_panel(img, img_hash, data, cal):
     view = compute_view(img.width, img.height, ss.zoom, ss.pan_x, ss.pan_y)
     highlight = ss.calib_next if ss.mode == MODE_CAL else None
+    grid = calibration_grid(cal, img.size, ss.calib) if cal is not None and ss.show_grid else None
     # drawn sharp at RENDER_W, then the browser scales it to fit the column
-    disp = render_view(img, view, RENDER_W, ss.calib, ss.datasets, ss.active, highlight, ss.connect)
+    disp = render_view(img, view, RENDER_W, ss.calib, ss.datasets, ss.active, highlight,
+                       ss.connect, grid)
     value = clickable_image(disp, key=f"img_{img_hash}", magnify=ss.magnify)
     # the component keeps returning its last click, so only act on new ones
     if value and value != ss.last_click:
         ss.last_click = value
         x0, y0, cw, ch = view
+        px, py = x0 + value["x"] * cw, y0 + value["y"] * ch
+        if ss.mode == MODE_ADD and ss.snap:
+            px, py = snap_to_marker(cached_ink(data, ss.rotation), px, py,
+                                    radius=max(5.0, 0.012 * img.width))
         # delete tolerance is about 1.5% of the visible width
-        handle_click(x0 + value["x"] * cw, y0 + value["y"] * ch, 0.015 * cw)
+        handle_click(px, py, 0.015 * cw)
         st.rerun()
 
 
@@ -1085,11 +1425,17 @@ def main():
         ss.img_hash = img_hash
         reset_work()
     try:
-        img, info = cached_decode(data)
+        info = cached_decode(data)[1]
+        tilt = cached_tilt(data)
     except Exception as e:  # corrupt or unsupported file
         st.error(f"Could not read this image: {e}")
         return
-    sidebar_settings(img, info)
+    # work on a straightened copy if the scan is crooked (and the user wants that)
+    angle = -tilt if ss.straighten and abs(tilt) >= 0.2 else 0.0
+    if angle != ss.rotation:
+        change_rotation(data, angle)
+    img = cached_rotate(data, angle)
+    sidebar_settings(img, info, tilt)
 
     cal, cal_err = current_calibration()
     calibrated = cal is not None
@@ -1108,7 +1454,7 @@ def main():
 
     left, right = st.columns([3, 2], gap="large")
     with left:
-        image_panel(img, img_hash)
+        image_panel(img, img_hash, data, cal)
     with right:
         if ss.mode == MODE_CAL:
             calibration_panel(calibrated, cal_err)
