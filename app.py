@@ -11,138 +11,20 @@ How to use it:
 4. Download the CSV (row 1 = dataset names, row 2 = axis labels, then the values).
 """
 
-import base64
 import copy
 import csv
 import hashlib
 import io
 import math
-import tempfile
 import uuid
 from pathlib import Path
 
 import numpy as np
+from streamlit_image_coordinates import streamlit_image_coordinates
 from scipy import ndimage
 import pandas as pd
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-
-
-# ---- Clickable image component ----
-# Streamlit can't report where you click on an image, so this small HTML page
-# does it. It shows the plot at the column width, sends back clicks as fractions
-# of the image size, and draws a magnifier under the cursor.
-
-CLICK_HTML = r"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
-#wrap { position: relative; width: 100%; line-height: 0; }
-#img { width: 100%; height: auto; display: block; cursor: crosshair; user-select: none;
-       -webkit-user-drag: none; border-radius: 6px; }
-#loupe { position: absolute; pointer-events: none; width: 160px; height: 160px; border-radius: 50%;
-         box-shadow: 0 0 0 2px #fff, 0 0 0 3px #000, 0 8px 24px rgba(0,0,0,.55);
-         background-repeat: no-repeat; background-color: #fff; display: none; }
-#loupe:before, #loupe:after { content: ""; position: absolute; background: rgba(255,40,40,.85); }
-#loupe:before { left: calc(50% - 0.5px); top: 22%; bottom: 22%; width: 1px; }
-#loupe:after { top: calc(50% - 0.5px); left: 22%; right: 22%; height: 1px; }
-</style>
-</head>
-<body>
-<div id="wrap"><img id="img" alt="plot"><div id="loupe"></div></div>
-<script>
-const img = document.getElementById("img");
-const loupe = document.getElementById("loupe");
-let mag = 3;
-let lastH = -1;
-
-function send(type, data) {
-  window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, data), "*");
-}
-
-// tell Streamlit how tall the iframe should be
-function setH() {
-  const h = Math.ceil(document.getElementById("wrap").getBoundingClientRect().height);
-  if (h !== lastH) {
-    lastH = h;
-    send("streamlit:setFrameHeight", {height: h});
-  }
-}
-
-window.addEventListener("message", function (e) {
-  if (!e.data || e.data.type !== "streamlit:render") return;
-  const a = e.data.args;
-  mag = a.magnify || 0;
-  if (img.getAttribute("src") !== a.src) {
-    img.setAttribute("src", a.src);
-  }
-  loupe.style.backgroundImage = "url('" + a.src + "')";
-  setH();
-});
-
-img.onload = setH;
-new ResizeObserver(setH).observe(document.body);
-
-img.addEventListener("click", function (ev) {
-  const r = img.getBoundingClientRect();
-  send("streamlit:setComponentValue", {dataType: "json", value: {
-    x: (ev.clientX - r.left) / r.width,
-    y: (ev.clientY - r.top) / r.height,
-    t: Date.now()}});
-});
-
-img.addEventListener("mousemove", function (ev) {
-  if (mag <= 1) {
-    loupe.style.display = "none";
-    return;
-  }
-  const r = img.getBoundingClientRect();
-  const x = ev.clientX - r.left, y = ev.clientY - r.top;
-  const R = 80, gap = 24;
-  // put the loupe above-right of the cursor so it never hides the target,
-  // flipping sides near an edge so it never gets cut off
-  let left = x + gap, top = y - gap - 2 * R;
-  if (left + 2 * R > r.width) left = x - gap - 2 * R;
-  if (top < 0) top = y + gap;
-  left = Math.max(0, Math.min(left, r.width - 2 * R));
-  top = Math.max(0, Math.min(top, r.height - 2 * R));
-  loupe.style.display = "block";
-  loupe.style.left = left + "px";
-  loupe.style.top = top + "px";
-  loupe.style.backgroundSize = (r.width * mag) + "px " + (r.height * mag) + "px";
-  loupe.style.backgroundPosition = (R - x * mag) + "px " + (R - y * mag) + "px";
-});
-
-img.addEventListener("mouseleave", function () { loupe.style.display = "none"; });
-
-send("streamlit:componentReady", {apiVersion: 1});
-</script>
-</body>
-</html>"""
-
-try:
-    import streamlit.components.v1 as components
-
-    comp_dir = Path(tempfile.gettempdir()) / "ne111_plot_click_v1"
-    comp_dir.mkdir(exist_ok=True)
-    html_file = comp_dir / "index.html"
-    # the script reruns on every click, so only write the file when it changed
-    if not html_file.exists() or html_file.read_text(encoding="utf-8") != CLICK_HTML:
-        html_file.write_text(CLICK_HTML, encoding="utf-8")
-    plot_click = components.declare_component("plot_click", path=str(comp_dir))
-except Exception:
-    # happens in the tests, where streamlit is faked; the maths still imports fine
-    plot_click = None
-
-
-def clickable_image(img, key, magnify):
-    """Show img and return {"x", "y", "t"} for the last click (x, y as fractions)."""
-    buf = io.BytesIO()
-    img.save(buf, "PNG", optimize=False, compress_level=3)
-    src = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-    return plot_click(src=src, magnify=magnify, key=key, default=None)
 
 
 # ---- Constants ----
@@ -166,7 +48,7 @@ IMAGE_TYPES = ["png", "jpg", "jpeg", "gif", "tif", "tiff", "bmp", "webp"]
 WIDGET_DEFAULTS = {"xlabel": "x", "ylabel": "y", "xlog": False, "ylog": False,
                    "X1_val": "0", "X2_val": "10", "Y1_val": "0", "Y2_val": "10",
                    "zoom": 1.0, "pan_x": 0.5, "pan_y": 0.5, "sort_x": False,
-                   "connect": False, "magnify": 3.0, "straighten": True,
+                   "connect": False, "straighten": True,
                    "snap": True, "show_grid": True, "xunit": "", "yunit": "",
                    "trace_n": 25, "trace_tol": 60, "adv_tools": False,
                    "round_prec": True, "x_step": "", "y_step": ""}
@@ -1258,148 +1140,23 @@ def handle_click(px, py, tol):
         ss.editor_ver += 1
 
 
-# ---- Styling ----
-# Look: black background, dark grey cards, white uppercase text with wide
-# letter spacing, small grey section labels and underlined tabs for the modes.
-# The st-key-... classes come from the key= given to each container/widget.
+# ---- Small display helpers ----
 
-CSS = """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400..900&display=swap');
-:root { --card:#1c1c1e; --card-hi:#2a2a2c; --line:#2c2c2e; --muted:#8e8e93; --soft:#c7c7cc; }
-.stApp p, .stApp label, .stApp button, .stApp input, .stApp textarea, .stApp li,
-.stApp h1, .stApp h2, .stApp h3, .stApp td, .stApp th, .dg-root { font-family:'Montserrat', sans-serif; }
-header[data-testid="stHeader"] { background:#000; }
-.block-container { padding:2.4rem 2rem 3rem; max-width:1500px; }
-section[data-testid="stSidebar"] { border-right:1px solid var(--line); }
-
-/* headings */
-.dg-topbar { text-align:center; font-weight:600; letter-spacing:.22em; font-size:.8rem;
-             padding:.2rem 0 1.1rem; border-bottom:1px solid var(--line); margin-bottom:1.2rem; }
-.dg-eyebrow { text-align:center; letter-spacing:.25em; font-size:.85rem; font-weight:500;
-              color:var(--soft); margin-top:2.5rem; }
-.dg-hero { text-align:center; font-weight:800; text-transform:uppercase;
-           font-size:clamp(1.8rem, 4vw, 3rem); line-height:1.08; letter-spacing:.01em;
-           margin:.6rem auto 2.2rem; max-width:900px; }
-.dg-label { color:var(--soft); text-transform:uppercase; letter-spacing:.09em; font-size:.74rem;
-            font-weight:600; margin:.4rem 0 .55rem; }
-.dg-label .r { float:right; color:var(--muted); }
-
-/* list cards */
-.dg-card { background:var(--card); border-radius:6px; padding:.95rem 1.1rem; display:flex;
-           align-items:center; gap:.8rem; border-left:3px solid transparent; }
-.dg-card.active { border-left-color:#fff; background:var(--card-hi); }
-.dg-card .t { font-weight:700; text-transform:uppercase; letter-spacing:.06em; font-size:.88rem; }
-.dg-card .s { color:var(--muted); text-transform:uppercase; letter-spacing:.07em; font-size:.68rem;
-              margin-top:.2rem; }
-.dg-card .grow { flex:1; min-width:0; }
-.dg-card .dots { color:var(--muted); letter-spacing:.1em; font-weight:700; }
-.dg-card .num { font-weight:800; font-size:1.4rem; color:var(--muted); width:2.2rem; }
-.swatch { display:inline-block; width:.85rem; height:.85rem; border-radius:50%; flex:none;
-          box-shadow:0 0 0 2px #000, 0 0 0 3px #555; }
-
-/* make the whole dataset card clickable: an invisible button stretched over it */
-[class*="st-key-dscard_"] { position:relative; gap:0 !important; }
-[class*="st-key-dscard_"] [data-testid="stElementContainer"]:has(button) {
-    position:absolute; inset:0; z-index:2; margin:0; }
-[class*="st-key-dscard_"] [data-testid="stElementContainer"]:has(button),
-[class*="st-key-dscard_"] [data-testid="stElementContainer"]:has(button) * {
-    width:100% !important; height:100% !important; max-width:none !important; }
-[class*="st-key-dscard_"] button { opacity:0; cursor:pointer; }
-
-/* instruction banner */
-.dg-banner { background:var(--card); border-radius:6px; padding:.85rem 1.1rem; margin:.2rem 0 1rem;
-             min-height:6.4rem; /* same height whatever the message, so the image never jumps */
-             border-left:3px solid #fff; }
-.dg-banner.warn { border-left-color:#ff9f0a; }
-.dg-banner.ok { border-left-color:#30d158; }
-.dg-banner .msg { font-size:.95rem; }
-.dg-banner .dg-label { margin:0 0 .25rem; }
-
-/* step tracker */
-.dg-steps { display:flex; gap:.5rem; flex-wrap:wrap; margin-bottom:1rem; }
-.dg-step { padding:.35rem .8rem; border-radius:999px; border:1px solid var(--line); color:var(--muted);
-           text-transform:uppercase; letter-spacing:.08em; font-size:.68rem; font-weight:600; }
-.dg-step.done { color:#fff; }
-.dg-step.now { background:#fff; color:#000; border-color:#fff; }
-
-/* mode radio drawn as underlined tabs */
-.st-key-mode_radio div[role="radiogroup"] { display:flex; gap:0; width:100%; border-bottom:1px solid var(--line); }
-.st-key-mode_radio, .st-key-mode_radio [data-testid="stRadio"],
-.st-key-mode_radio [data-testid="stRadio"] > div { width:100% !important; }
-.st-key-mode_radio div[role="radiogroup"] > * { flex:1; margin:0 !important; }
-.st-key-mode_radio [data-testid="stRadioOption"] { width:100%; justify-content:center; margin:0;
-    padding:.65rem 0 .7rem; border-bottom:2px solid transparent; cursor:pointer; }
-.st-key-mode_radio [data-testid="stRadioOption"] > div > div:first-child { display:none; }
-.st-key-mode_radio [data-testid="stRadioOption"] p { white-space:nowrap; text-transform:uppercase;
-    letter-spacing:.1em; font-weight:600; font-size:.82rem; color:var(--muted); }
-.st-key-mode_radio [data-testid="stRadioOption"][data-selected="true"] { border-bottom-color:#fff; }
-.st-key-mode_radio [data-testid="stRadioOption"][data-selected="true"] p { color:#fff; }
-.st-key-mode_radio [data-testid="stRadioOption"]:hover p { color:#fff; }
-
-/* buttons */
-.stButton button, .stDownloadButton button, [data-testid="stPopover"] button {
-    background:var(--card); border:1px solid transparent; color:#fff; border-radius:6px; }
-.stButton button p, .stDownloadButton button p, [data-testid="stPopover"] button p {
-    text-transform:uppercase; letter-spacing:.08em; font-weight:600; font-size:.74rem; }
-.stButton button:hover, .stDownloadButton button:hover, [data-testid="stPopover"] button:hover {
-    background:var(--card-hi); border-color:#3a3a3c; color:#fff; }
-button[data-testid="stBaseButton-primary"] { background:#fff !important; color:#000 !important; }
-button[data-testid="stBaseButton-primary"] p { color:#000 !important; }
-button[data-testid="stBaseButton-primary"]:hover { background:#d9d9d9 !important; }
-.stButton button:disabled { opacity:.35; }
-.stButton button, [data-testid="stPopover"] button { padding-left:.5rem; padding-right:.5rem; }
-
-/* inputs and bordered containers */
-[data-baseweb="input"], [data-baseweb="select"] > div, [data-baseweb="textarea"] {
-    background:var(--card) !important; border-color:transparent !important; }
-[data-testid="stFileUploaderDropzone"] { background:var(--card); border:1px dashed #3a3a3c; }
-[class*="st-key-card_"] { background:var(--card); border:none !important; }
-.stApp label p { text-transform:uppercase; letter-spacing:.07em; font-size:.7rem; font-weight:600;
-                 color:var(--soft); }
-.st-key-mode_radio label p { font-size:.82rem; }
-[data-testid="stCaptionContainer"] { color:var(--muted); }
-hr { border-color:var(--line) !important; }
-/* switched-on toggles in green */
-label:has(input[role="switch"]:checked) > div:first-of-type { background:rgb(0, 194, 141) !important; }
-label:has(input[role="switch"]:checked) > div:first-of-type > div { background:#fff !important; }
-/* the tick in a checked checkbox: black on the white box */
-[data-testid="stCheckbox"] svg polyline { stroke:#000 !important; }
-</style>
-"""
+# coloured-circle emoji, so a dataset's colour can be shown in plain text
+EMOJI_COLOURS = {"🔴": (220, 40, 50), "🟠": (245, 130, 40), "🟡": (250, 210, 40),
+                 "🟢": (60, 180, 75), "🔵": (50, 110, 220), "🟣": (145, 50, 180),
+                 "🟤": (150, 100, 40), "⚫": (20, 20, 20), "⚪": (240, 240, 240)}
 
 
-# ---- Small HTML helpers ----
-
-def md_to_html(text):
-    """Turn **bold** into <b>bold</b> for the banner messages."""
-    parts = text.split("**")
-    return "".join(f"<b>{p}</b>" if i % 2 else p for i, p in enumerate(parts))
-
-
-def html(markup, where=st):
-    where.markdown(markup, unsafe_allow_html=True)
-
-
-def label(text, right="", where=st):
-    """Small grey section heading, with optional text on the right."""
-    r = f"<span class='r'>{right}</span>" if right else ""
-    html(f"<div class='dg-label'>{text}{r}</div>", where)
-
-
-def banner(step, msg, kind=""):
-    """Instruction box. kind is "", "ok" or "warn" (changes the edge colour)."""
-    html(f"<div class='dg-banner {kind}'><div class='dg-label'>{step}</div>"
-         f"<div class='msg'>{md_to_html(msg)}</div></div>")
-
-
-def card(title, subtitle, left, right="", active=False, style=""):
-    """HTML for one of the dark list cards, with extra HTML on the left and right."""
-    cls = "dg-card active" if active else "dg-card"
-    style_attr = f" style='{style}'" if style else ""
-    return (f"<div class='{cls}'{style_attr}>{left}"
-            f"<div class='grow'><div class='t'>{title}</div><div class='s'>{subtitle}</div></div>"
-            f"{right}</div>")
+def colour_dot(hex_colour):
+    """The coloured-circle emoji closest to a "#rrggbb" colour."""
+    rgb = [int(hex_colour[i:i + 2], 16) for i in (1, 3, 5)]
+    best, best_d = "⚪", None
+    for emoji, ref in EMOJI_COLOURS.items():
+        d = sum((a - b) ** 2 for a, b in zip(rgb, ref))
+        if best_d is None or d < best_d:
+            best, best_d = emoji, d
+    return best
 
 
 # ---- Sidebar ----
@@ -1444,7 +1201,7 @@ def cached_ink(data, angle):
 
 def sidebar_image():
     """File uploader / sample buttons. Returns (image bytes or None, file name stem)."""
-    label("Image", where=st.sidebar)
+    st.sidebar.header("Image")
     up = st.sidebar.file_uploader(
         "Upload a plot image", type=IMAGE_TYPES, label_visibility="collapsed",
         help="PNG, JPG, GIF, TIFF, BMP or WebP. Colour or greyscale.")
@@ -1464,10 +1221,6 @@ def times_text(z):
     return f"{z:g}×"
 
 
-def magnifier_text(m):
-    return "Off" if m == 1 else times_text(m)
-
-
 def sidebar_settings(img, info, tilt):
     kind = "greyscale" if info["greyscale"] else "colour"
     frames = f" · frame 1 of {info['frames']}" if info["frames"] > 1 else ""
@@ -1480,8 +1233,7 @@ def sidebar_settings(img, info, tilt):
     else:
         st.sidebar.caption("Image is already straight.")
 
-    st.sidebar.write("")
-    label("Axis labels", where=st.sidebar)
+    st.sidebar.header("Axis labels")
     c1, c2 = st.sidebar.columns([2, 1])
     c1.text_input("x-axis label", key="xlabel", help="Used as the column header in the CSV")
     c2.text_input("Unit", key="xunit", placeholder="e.g. h", help='Shown as "Time (h)"')
@@ -1489,11 +1241,7 @@ def sidebar_settings(img, info, tilt):
     c1.text_input("y-axis label", key="ylabel")
     c2.text_input("Unit", key="yunit", placeholder="e.g. Bq")
 
-    st.sidebar.write("")
-    label("View", where=st.sidebar)
-    st.sidebar.select_slider("Magnifier", options=[1.0, 2.0, 3.0, 4.0, 6.0], key="magnify",
-                             format_func=magnifier_text,
-                             help="Loupe that follows the cursor over the plot")
+    st.sidebar.header("View")
     st.sidebar.select_slider("Zoom", options=[1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0], key="zoom",
                              format_func=times_text,
                              help="Zoom in to place points more precisely")
@@ -1520,59 +1268,47 @@ def sidebar_settings(img, info, tilt):
 # ---- Main page sections ----
 
 def step_tracker(calibrated, n_pts):
-    """Row of pills: finished steps get a tick, the first unfinished one is highlighted."""
-    steps = [("Upload", True), ("Calibrate", calibrated), ("Digitize", n_pts > 0), ("Export", False)]
-    pills = []
-    found_current = False
-    for i, (name, done) in enumerate(steps, 1):
-        if done:
-            cls, mark = "done", "✓"
-        elif not found_current:
-            cls, mark = "now", f"0{i}"
-            found_current = True
-        else:
-            cls, mark = "", f"0{i}"
-        pills.append(f"<span class='dg-step {cls}'>{mark}&nbsp; {name}</span>")
-    html(f"<div class='dg-steps'>{''.join(pills)}</div>")
+    """Progress bar showing which of the four steps the user is on."""
+    steps = [("Upload an image", True), ("Calibrate the axes", calibrated),
+             ("Click the data", n_pts > 0), ("Download the CSV", False)]
+    done = 0
+    for name, finished in steps:
+        if not finished:
+            break
+        done += 1
+    st.progress(done / len(steps), text=f"Step {done + 1} of {len(steps)} · {steps[done][0]}")
 
 
 def instruction(calibrated, cal_err):
-    if ss.mode == MODE_CAL:
-        step = "Step 2 · Calibrate"
+    """What to do next, shown at the top of the right-hand panel."""
+    if ss.mode != MODE_CAL and not calibrated:
+        st.warning(f"Calibrate the axes first. {cal_err}")
+    elif ss.mode == MODE_CAL:
         if ss.calib_next:
-            banner(step, f"Click the image to place **{ss.calib_next}**, {CAL_HELP[ss.calib_next]}.")
+            st.info(f"Click the image to place **{ss.calib_next}**, {CAL_HELP[ss.calib_next]}.")
         elif calibrated:
-            banner(step, "Calibration done. Check the values on the right, then start digitizing.", "ok")
+            st.success("Calibration done. Check the values below, then start digitizing.")
         else:
-            banner(step, cal_err or "", "warn")
+            st.warning(cal_err or "")
     elif ss.mode == MODE_ADD:
-        step = "Step 3 · Digitize"
-        if not calibrated:
-            banner(step, f"Calibrate the axes first. {cal_err}", "warn")
-        else:
-            name = ss.datasets[ss.active]["name"]
-            banner(step, f"Click data points to add them to **{name}**. "
-                         "Use **+ New dataset** for another curve.")
+        name = ss.datasets[ss.active]["name"]
+        st.info(f"Click data points to add them to **{name}**. "
+                "Use **+ New dataset** for another curve.")
     elif ss.mode == MODE_TRACE:
-        step = "Step 3 · Auto-trace"
-        if not calibrated:
-            banner(step, f"Calibrate the axes first. {cal_err}", "warn")
-        else:
-            banner(step, "Click right on a curve to trace it. Each curve you click "
-                         "goes into its own dataset.")
+        st.info("Click right on a curve to trace it. Each curve you click goes into its own dataset.")
     else:
-        banner("Edit", "Click a point on the image to delete it.")
+        st.info("Click a point on the image to delete it.")
 
 
 def calibration_panel(calibrated, cal_err, data):
-    label("Axis calibration")
+    st.subheader("Axis calibration")
     st.caption("Place two points on each axis at values you know (labelled ticks are best). "
                "Rotated or skewed scans are handled automatically.")
     st.button("Auto-detect axes", on_click=cb_auto_axes, args=(data,), width="stretch",
               help="Finds the axis lines and puts X1, X2, Y1, Y2 on the first and last "
                    "tick marks. You still type in the values.")
     for axis, keys in [("x", ["X1", "X2"]), ("y", ["Y1", "Y2"])]:
-        with st.container(border=True, key=f"card_{axis}"):
+        with st.container(border=True):
             st.toggle(f"Logarithmic {axis}-axis", key=f"{axis}log")
             for k in keys:
                 c1, c2 = st.columns([1.1, 1])
@@ -1639,22 +1375,24 @@ def show_parsed(text):
         st.caption(f"= {fmt(v)}")
 
 
-def dataset_cards():
-    """One card per dataset; clicking a card selects it."""
-    for i, ds in enumerate(ss.datasets):
-        n = len(ds["points"])
-        active = i == ss.active
-        subtitle = f"{n} point{'' if n == 1 else 's'}{' · active' if active else ''}"
-        swatch = f"<span class='swatch' style='background:{ds['color']}'></span>"
-        with st.container(key=f"dscard_{ds['uid']}"):
-            html(card(ds["name"], subtitle, swatch, "<span class='dots'>•••</span>", active))
-            st.button(f"Select {ds['name']}", key=f"sel_{ds['uid']}",
-                      on_click=cb_set, kwargs={"active": i})
+def dataset_label(i):
+    """Radio-button text for dataset i, e.g. "🔴 Dataset 1 · 5 points"."""
+    ds = ss.datasets[i]
+    n = len(ds["points"])
+    return f"{colour_dot(ds['color'])} {ds['name']} · {n} point{'' if n == 1 else 's'}"
+
+
+def dataset_list():
+    """Pick the active dataset (new clicks go into it)."""
+    ss.active_radio = ss.active  # ss.active is the real value; copy it in before drawing
+    st.radio("Active dataset (new clicks go here)", list(range(len(ss.datasets))),
+             format_func=dataset_label, key="active_radio",
+             on_change=cb_copy, args=("active_radio", "active"))
 
 
 def trace_settings():
-    with st.container(border=True, key="card_trace"):
-        label("Auto-trace settings")
+    with st.container(border=True):
+        st.markdown("**Auto-trace settings**")
         st.slider("Points per curve", 5, 100, key="trace_n",
                   help="How many evenly spaced points to take along each traced curve")
         st.slider("Colour tolerance", 20, 150, key="trace_tol",
@@ -1665,7 +1403,7 @@ def trace_settings():
 def advanced_tools(ds, cal):
     """Reorder, sort, reverse and merge (hidden behind a switch to keep things simple)."""
     i = ss.active
-    with st.container(border=True, key="card_tools"):
+    with st.container(border=True):
         c1, c2 = st.columns(2)
         c1.button("↑ Move up", on_click=cb_move_dataset, args=(i, -1), width="stretch",
                   disabled=i == 0, help="Earlier in the list and in the CSV")
@@ -1687,15 +1425,14 @@ def advanced_tools(ds, cal):
 
 
 def datasets_panel(cal):
-    label("Datasets", f"{len(ss.datasets)} total")
+    st.subheader("Datasets")
     ss.active = min(ss.active, len(ss.datasets) - 1)
-    dataset_cards()
+    dataset_list()
     st.button("+ New dataset", on_click=cb_add_dataset, width="stretch",
               help="Add another dataset, e.g. for a second curve")
 
     ds = ss.datasets[ss.active]
-    st.write("")
-    label("Edit selected")
+    st.markdown("**Edit the selected dataset**")
     c1, c2 = st.columns([3, 1.2], vertical_alignment="bottom")
     name = c1.text_input("Name", value=ds["name"], key=f"name_{ds['uid']}").strip()
     ds["name"] = name or f"Dataset {ss.active + 1}"
@@ -1715,8 +1452,7 @@ def datasets_panel(cal):
     if ss.adv_tools:
         advanced_tools(ds, cal)
 
-    st.write("")
-    label("Points", "edit to move marks")
+    st.markdown("**Points** (edit a value to move its mark)")
     if cal is None:
         st.caption("Calibrate the axes to see values.")
         return
@@ -1772,7 +1508,7 @@ def unique_names(names):
 
 def clean_up_card(cal):
     """Options that stop mouse wobble showing up as extra digits (0.0124 instead of 0)."""
-    with st.container(border=True, key="card_clean"):
+    with st.container(border=True):
         c1, c2, c3 = st.columns([2, 1, 1], vertical_alignment="bottom")
         c1.checkbox("Round to image precision", key="round_prec",
                     help="Drops digits finer than one pixel of the image, "
@@ -1792,7 +1528,7 @@ def clean_up_card(cal):
 def results_section(cal, file_stem):
     st.divider()
     if cal is None:
-        label("Results")
+        st.subheader("Results")
         st.caption("Calibrate the axes and click some points to see the results here.")
         return
 
@@ -1807,7 +1543,8 @@ def results_section(cal, file_stem):
     rows = csv_rows(export, xtitle, ytitle)
     filled = [e for e in export if e["data"]]
     total = sum([len(e["data"]) for e in filled])
-    label("Results", f"{len(filled)} datasets · {total} points")
+    st.subheader("Results")
+    st.caption(f"{len(filled)} datasets · {total} points")
     clean_up_card(cal)
 
     c1, c2, c3 = st.columns([2, 2, 3], vertical_alignment="center")
@@ -1825,28 +1562,29 @@ def results_section(cal, file_stem):
     table, plot = st.columns([3, 2], gap="large")
     with table:
         # preview table, same layout as the CSV with "name · label" headers
-        label("CSV preview")
+        st.markdown("**CSV preview**")
         header = [f"{e['name']} · {lab}" for e in filled for lab in (xtitle, ytitle)]
         st.dataframe(pd.DataFrame(rows[2:], columns=unique_names(header)), width="stretch",
                      hide_index=True, height=min(38 + 35 * (len(rows) - 2), 420))
     with plot:
-        label("Check plot", "compare with the original")
+        st.markdown("**Check plot** (compare with the original)")
         st.image(cached_replot(filled, xtitle, ytitle, ss.xlog, ss.ylog))
 
 
 def welcome():
-    html("<div class='dg-eyebrow'>PLOT DIGITIZER</div>"
-         "<div class='dg-hero'>Turn any graph into<br>data you can use</div>")
+    st.title("Plot Digitizer")
+    st.subheader("Turn any graph into data you can use")
     _, mid, _ = st.columns([1, 2, 1])
     with mid:
-        label("How it works")
+        st.markdown("**How it works**")
         steps = [("Upload", "PNG, JPG, GIF or TIFF · colour or greyscale"),
                  ("Calibrate", "Two known points per axis · linear or log · crooked scans OK"),
                  ("Digitize", "Click the data · one colour per dataset"),
                  ("Export", "CSV with dataset names and axis labels")]
         for i, (title, text) in enumerate(steps, 1):
-            html(card(title, text, f"<span class='num'>0{i}</span>", style="margin-bottom:.5rem"))
-        st.write("")
+            with st.container(border=True):
+                st.markdown(f"**0{i} · {title}**")
+                st.caption(text)
         st.button("Try a sample plot", type="primary", width="stretch",
                   on_click=cb_set, kwargs={"use_sample": True})
         st.caption("Or upload your own image in the sidebar.")
@@ -1880,12 +1618,15 @@ def image_panel(img, img_hash, data, cal):
     # drawn sharp at RENDER_W, then the browser scales it to fit the column
     disp = render_view(img, view, RENDER_W, ss.calib, ss.datasets, ss.active, highlight,
                        ss.connect, grid)
-    value = clickable_image(disp, key=f"img_{img_hash}", magnify=ss.magnify)
+    value = streamlit_image_coordinates(disp, key=f"img_{img_hash}", width="stretch",
+                                        png_compression_level=1, cursor="crosshair")
     # the component keeps returning its last click, so only act on new ones
     if value and value != ss.last_click:
         ss.last_click = value
         x0, y0, cw, ch = view
-        px, py = x0 + value["x"] * cw, y0 + value["y"] * ch
+        # the click is in displayed pixels; scale it back to the original image
+        px = x0 + value["x"] * cw / value["width"]
+        py = y0 + value["y"] * ch / value["height"]
         if ss.mode == MODE_TRACE:
             trace_click(img, data, cal, px, py)
             st.rerun()
@@ -1902,14 +1643,13 @@ def image_panel(img, img_hash, data, cal):
 
 def main():
     st.set_page_config(page_title="Plot Digitizer", page_icon="📈", layout="wide")
-    html(CSS)
     init_state()
 
     data, stem = sidebar_image()
     if data is None:
         welcome()
         return
-    html("<div class='dg-topbar'>PLOT DIGITIZER</div>")
+    st.title("Plot Digitizer")
 
     img_hash = hashlib.md5(data).hexdigest()[:12]
     if ss.img_hash != img_hash:  # new image, so start fresh
@@ -1941,12 +1681,12 @@ def main():
     ss.mode_radio = ss.mode
     st.radio("Mode", MODES, key="mode_radio", horizontal=True, label_visibility="collapsed",
              on_change=cb_copy, args=("mode_radio", "mode"))
-    instruction(calibrated, cal_err)
 
     left, right = st.columns([5, 3], gap="medium")
     with left:
         image_panel(img, img_hash, data, cal)
     with right:
+        instruction(calibrated, cal_err)
         if ss.mode == MODE_CAL:
             calibration_panel(calibrated, cal_err, data)
         else:
