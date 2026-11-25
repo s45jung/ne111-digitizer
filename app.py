@@ -1016,6 +1016,8 @@ button[data-testid="stBaseButton-primary"]:hover { background:#d9d9d9 !important
 .st-key-mode_radio label p { font-size:.82rem; }
 [data-testid="stCaptionContainer"] { color:var(--muted); }
 hr { border-color:var(--line) !important; }
+/* the tick in a checked checkbox: black on the white box */
+[data-testid="stCheckbox"] svg polyline { stroke:#000 !important; }
 </style>
 """
 
