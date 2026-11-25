@@ -717,7 +717,7 @@ def trace_curve(img, click, cal, calib, n_points, tol=60):
     a = np.asarray(img, dtype=float)
     h, w, _ = a.shape
     ink = ink_map(img)
-    r = 6
+    r = 10  # forgiving: the click only has to be near the curve
     x0, y0 = max(0, int(click[0]) - r), max(0, int(click[1]) - r)
     patch = ink[y0: int(click[1]) + r + 1, x0: int(click[0]) + r + 1]
     if patch.size == 0 or patch.max() < 60:
